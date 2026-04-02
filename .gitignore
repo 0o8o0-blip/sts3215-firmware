@@ -1,0 +1,43 @@
+# Build artifacts
+__pycache__/
+*.pyc
+*.o
+*.elf
+*.map
+*.dis
+.pio/
+.vscode/
+firmware/build/
+
+# Binary firmware files (not suitable for version control)
+# Use tools/flash_tool.py to download factory firmware from Feetech servers
+# Use tools/encrypt.py to encrypt our firmware for flashing
+firmware/encrypted/
+firmware/decrypted
+firmware/decrypted/
+firmware/rescue/
+
+# Development artifacts
+_archive/
+firmware/compare_functions.py
+firmware/test/overnight_results.txt
+
+# Differential tests (require original binary, not for public repo)
+firmware/test/diff_test.py
+firmware/test/full_diff_test.py
+firmware/test/fuzz_test.py
+firmware/test/system_test.py
+firmware/test/periph_diff_test.py
+firmware/test/coverage_test.py
+firmware/test/capture_golden.py
+firmware/test/gd32f130.repl
+firmware/test/renode_boot_test.resc
+
+# Ghidra project (regeneratable, large)
+ghidra/
+
+# Python virtual environment
+.venv/
+
+# Temp files
+/tmp/
