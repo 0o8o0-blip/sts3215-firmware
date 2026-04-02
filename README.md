@@ -128,10 +128,7 @@ tools/
   flash_tool.py        UART firmware update tool (AES-256-ECB encrypted blocks)
   encrypt.py           Firmware encryption for bootloader compatibility
 pics/
-  frount.webp          PCB front — MCU, connectors, encoder
-  front1.webp          PCB front — alternate angle
-  back.webp            PCB back — H-bridge, gate driver, power
-  back1.webp           PCB back — component labels visible
+  step_response_comparison.png  Factory vs open source step response
 ```
 
 ## Building
