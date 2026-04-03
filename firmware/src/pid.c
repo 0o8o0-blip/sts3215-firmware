@@ -843,22 +843,25 @@ void __attribute__((noinline)) pid_current_compute(uint8_t *param)
         return;
     }
 
+    /* If goal is zero, output zero immediately — no PID needed.
+     * This prevents ADC noise from causing integrator wind-up. */
+    sr = servo_regs;
+    uint16_t goal_raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
+    if ((goal_raw & ~(uint16_t)PWM_GOAL_SIGN_BIT) == 0) {
+        s[0] = 0;
+        s[1] = 0;
+        s[2] = 0;
+        volatile uint8_t *pc = pwm_ctrl;
+        *(int16_t *)(pc + PWM_OUTPUT) = 0;
+        return;
+    }
+
     pid_cur_error(s);
-    pid_spd_iterm_integrate(s);  /* Reuse speed I-term integration */
-    int32_t p = pid_spd_pterm(s);  /* Reuse speed P-term (same gain registers) */
-    int32_t i = pid_spd_iterm(s);  /* Reuse speed I-term (same gain registers) */
+    pid_spd_iterm_integrate(s);
+    int32_t p = pid_spd_pterm(s);
+    int32_t i = pid_spd_iterm(s);
 
     int32_t output = p + i;
-
-    /* No punch bias in current mode — zero goal must produce zero output.
-     * Punch is for overcoming static friction in position/speed mode;
-     * in current mode, output must be proportional to the goal. */
-
-    /* Deadzone: suppress ADC noise near zero to prevent integrator wind-up */
-    if (s[0] > -3 && s[0] < 3) {
-        s[0] = 0;
-        output = i;  /* P=0, keep I for steady-state tracking */
-    }
 
     s[2] = s[0];
 
