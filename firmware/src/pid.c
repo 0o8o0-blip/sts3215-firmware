@@ -675,10 +675,11 @@ current_mode:
      * Reuses the speed PID state area (EI2C_SPEED_STATE) since current
      * and speed modes are mutually exclusive.
      *
-     * No speed_stall_check here: stall detection assumes a speed/position
-     * feedback loop exists. Current mode has no speed accumulator, so the
-     * stall detector always fires as a false positive. Current is already
-     * protected by overload_protect() in Step 3. */
+     * No speed_stall_check: stall detection assumes "not moving = fault",
+     * but in current mode, holding position under load (e.g. gravity
+     * compensation) is intentional and normal. Overcurrent protection
+     * via overload_protect() in Step 3 is the correct safety mechanism
+     * for current mode — it monitors actual current draw, not movement. */
     pid_current_compute(encoder_i2c_arr + EI2C_SPEED_STATE);
     {
         uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
