@@ -8,7 +8,6 @@ __pycache__/
 .pio/
 .vscode/
 firmware/build/
-firmware/cache/
 
 # Python virtual environment
 .venv/
