@@ -126,6 +126,7 @@ firmware/
   Makefile
 tools/
   flash_tool.py        UART firmware update tool (AES-256-ECB encrypted blocks)
+  rescue.py            Recover bricked servos via bootloader power-cycle catch
   encrypt.py           Firmware encryption for bootloader compatibility
 pics/
   step_response_comparison.png  Factory vs open source step response
@@ -169,6 +170,40 @@ python3 tools/flash_tool.py --port /dev/ttyACM0 --servo-id 1 --flash
 ```
 
 This downloads the latest SCServo21 firmware, encrypts it for the bootloader, and flashes it. No backup needed — the factory firmware is always available from the server. The servo will behave exactly as it did from the factory after flashing.
+
+### Rescuing Bricked Servos
+
+If a servo stops responding after a failed flash (LED on but no UART response), it can be recovered via the bootloader. The bootloader is never overwritten by UART flashing and is always available.
+
+```bash
+# Connect ONLY the bricked servo (disconnect all others!)
+python3 tools/rescue.py --port /dev/ttyACM0
+# Follow the prompts to power cycle the servo
+```
+
+**Common causes of bricked servos:**
+- **Multiple servos on the bus during flash** — the bootloader has no servo ID, so all servos enter bootloader mode simultaneously. Only flash with one servo connected, or use `--servo-id` with the flash tool (which sends a targeted reboot command first).
+- **Power loss during flash** — keep power stable during the ~10 second transfer.
+- **Wrong firmware file** — use `encrypt.py` for our firmware, or let `flash_tool.py --flash` download the correct factory firmware automatically.
+
+### Safety Guide
+
+**Do not disable motor protection registers.** Register 19 (`alarm_shutdown`) controls which fault conditions shut down the motor. Writing 0 to this register disables all protection and can burn out the motor within seconds if it stalls or draws excessive current.
+
+**Keep `max_output` (registers 48-49) conservative** when testing new firmware or modes. Start with low values (40-60) and increase gradually. This register caps the maximum PWM duty cycle regardless of what the PID computes.
+
+**Current control mode (mode 4) safety:**
+- The motor produces constant torque proportional to the goal — with no load it will spin at maximum speed
+- Use `max_output` to limit the maximum force the motor can produce
+- Start with very small goals (1-5) and increase gradually
+- The built-in overload protection (`overload_protect`) remains active and will kill torque if current exceeds safe limits for too long
+- Never bypass overload protection — it is the primary safety mechanism for current mode
+
+**General testing tips:**
+- Test with a loose servo on the bench, not mounted in an arm
+- Keep the power supply current-limited if possible
+- After any firmware change, verify position mode works before testing other modes
+- If the servo makes excessive noise when held, the goal or max_output is too high — reduce it
 
 ## Testing
 
