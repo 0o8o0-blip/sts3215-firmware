@@ -216,7 +216,7 @@ void __attribute__((noinline)) motor_safety_apply(uint8_t *adc_st)
     (void)adc_st;
     volatile uint8_t *sr = servo_regs;
     if (sr[SR_OPERATING_MODE] != 2) {
-        /* Position/speed/multi-turn mode: check I2C encoder errors */
+        /* Position/speed/multi-turn/current mode: check I2C encoder errors */
         i2c_error_stop();
     } else {
         /* PWM mode: compute output from servo_regs[44-45] and apply */
