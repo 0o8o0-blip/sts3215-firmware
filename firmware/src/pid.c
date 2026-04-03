@@ -847,14 +847,14 @@ void __attribute__((noinline)) pid_current_compute(uint8_t *param)
 
     int32_t output = p + i;
 
-    /* Add punch bias (minimum drive force) */
-    sr = servo_regs;
-    if (output > 0) {
-        output += (int32_t)(uint32_t)sr[SR_PUNCH_MIN];
-    }
-    sr = servo_regs;
-    if (output < 0) {
-        output -= (int32_t)(uint32_t)sr[SR_PUNCH_MIN];
+    /* No punch bias in current mode — zero goal must produce zero output.
+     * Punch is for overcoming static friction in position/speed mode;
+     * in current mode, output must be proportional to the goal. */
+
+    /* Deadzone: suppress ADC noise near zero to prevent integrator wind-up */
+    if (s[0] > -3 && s[0] < 3) {
+        s[0] = 0;
+        output = i;  /* P=0, keep I for steady-state tracking */
     }
 
     s[2] = s[0];

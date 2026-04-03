@@ -1223,8 +1223,8 @@ class GoldenPeriphTests:
         output = struct.unpack_from('<h', sram, pwm_ctrl - SRAM_BASE + 6)[0]
         self.check('current PID goal=100 actual=0: output > 0',
                    output > 0, f'got {output}')
-        self.check('current PID goal=100 actual=0: output = 136',
-                   output == 136, f'got {output}')
+        self.check('current PID goal=100 actual=0: output = 120',
+                   output == 120, f'got {output}')
 
         # Goal = actual → output = 0
         self.uc.mem_write(pwm_ctrl + 0x14, struct.pack('<h', 100))
