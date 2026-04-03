@@ -454,6 +454,16 @@ def flash_firmware(ser, servo_id, firmware_data, firmware_type="bin",
     num_blocks = (len(fw_payload) + BLOCK_SIZE - 1) // BLOCK_SIZE
     print(f"\nFirmware: {len(firmware_data)} bytes, {num_blocks} blocks")
 
+    # Step 0: Silence other servos on the bus
+    # Factory firmware responds to garbage bytes when the bus switches to 500k
+    # for bootloader communication, causing bus contention. Writing return_level=0
+    # via broadcast disables UART responses on all servos, preventing collisions.
+    print("\n[Step 0] Silencing other servos on bus...")
+    REG_RETURN_LEVEL = 8
+    feetech_send(ser, 0xFE, INST_WRITE, bytes([REG_RETURN_LEVEL, 0]))
+    time.sleep(0.01)
+    ser.reset_input_buffer()
+
     # Step 1: Enter bootloader
     print("\n[Step 1] Entering bootloader mode...")
     if not enter_bootloader(ser, servo_id, bus_baudrate, mode=mode):
@@ -559,9 +569,12 @@ def flash_firmware(ser, servo_id, firmware_data, firmware_type="bin",
 
     print(f"\n\n[Step 5] Firmware transfer complete!")
 
-    # Restore original baud rate
+    # Restore original baud rate and re-enable responses on other servos
     ser.baudrate = bus_baudrate
     time.sleep(0.5)
+    feetech_send(ser, 0xFE, INST_WRITE, bytes([REG_RETURN_LEVEL, 1]))
+    time.sleep(0.01)
+    ser.reset_input_buffer()
 
     return True
 
