@@ -396,6 +396,9 @@ void __attribute__((noinline)) pid_compute(uint8_t *state)
             /* Speed mode */
             speed_pid((int32_t *)state);
             servo_regs_arr[SR_TORQUE_ENABLE] = 1;
+        } else if (servo_regs_arr[SR_OPERATING_MODE] == 4) {
+            /* Current mode: re-enable torque if overload cleared */
+            servo_regs_arr[SR_TORQUE_ENABLE] = 1;
         }
     }
 

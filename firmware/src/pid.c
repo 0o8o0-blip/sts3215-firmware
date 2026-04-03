@@ -673,10 +673,13 @@ speed_mode:
 current_mode:
     /* Current (torque) control mode — closes the loop on motor current.
      * Reuses the speed PID state area (EI2C_SPEED_STATE) since current
-     * and speed modes are mutually exclusive. */
+     * and speed modes are mutually exclusive.
+     *
+     * No speed_stall_check here: stall detection assumes a speed/position
+     * feedback loop exists. Current mode has no speed accumulator, so the
+     * stall detector always fires as a false positive. Current is already
+     * protected by overload_protect() in Step 3. */
     pid_current_compute(encoder_i2c_arr + EI2C_SPEED_STATE);
-    speed_stall_check(timer_ctrl_arr + TMR_MOTION_BASE);
-    motor_safety_halt();
     {
         uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
         if (torque_enable != 1) {
