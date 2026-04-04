@@ -375,10 +375,12 @@ void __attribute__((noinline)) pid_compute(uint8_t *state)
             state[PID_PROFILE_RESET] = 0;
         }
 
-        /* Trigger motion update for position/multi-turn modes */
+        /* Trigger motion update for position-based modes */
         if (servo_regs_arr[SR_OPERATING_MODE] == 0) {
             servo_regs_arr[SR_TORQUE_ENABLE] = 1;
         } else if (servo_regs_arr[SR_OPERATING_MODE] == 3) {
+            servo_regs_arr[SR_TORQUE_ENABLE] = 1;
+        } else if (servo_regs_arr[SR_OPERATING_MODE] == 5) {
             servo_regs_arr[SR_TORQUE_ENABLE] = 1;
         }
     }
@@ -398,6 +400,10 @@ void __attribute__((noinline)) pid_compute(uint8_t *state)
             servo_regs_arr[SR_TORQUE_ENABLE] = 1;
         } else if (servo_regs_arr[SR_OPERATING_MODE] == 4) {
             /* Current mode: re-enable torque if overload cleared */
+            servo_regs_arr[SR_TORQUE_ENABLE] = 1;
+        } else if (servo_regs_arr[SR_OPERATING_MODE] == 5) {
+            /* Cascaded position/current: use position PID + re-enable */
+            position_pid((int32_t *)state);
             servo_regs_arr[SR_TORQUE_ENABLE] = 1;
         }
     }

@@ -130,8 +130,8 @@ void __attribute__((noinline)) adc_overload_check(uint8_t *param)
 {
     volatile uint8_t *sr = servo_regs;
     uint8_t mode = sr[SR_OPERATING_MODE];
-    if (mode == 2 || mode == 1 || mode == 4) {
-        /* PWM, speed, or current mode: copy overload flag directly */
+    if (mode == 2 || mode == 1 || mode == 4 || mode == 5) {
+        /* PWM, speed, current, or cascaded mode: copy overload flag directly */
         sr = servo_regs;
         sr[SR_RESERVED_42] = param[0];
         return;

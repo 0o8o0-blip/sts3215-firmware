@@ -115,7 +115,7 @@
 #define SR_PUNCH_DIVISOR    30    /* Punch divisor (default 1, must not be 0) */
 #define SR_GOAL_OFFSET_LO  31    /* Goal position offset low */
 #define SR_GOAL_OFFSET_HI  32    /* Goal position offset high */
-#define SR_OPERATING_MODE   33    /* 0=position, 1=speed, 2=PWM, 3=multi-turn, 4=current */
+#define SR_OPERATING_MODE   33    /* 0=position, 1=speed, 2=PWM, 3=multi-turn, 4=current, 5=position+current */
 #define SR_MAX_SPEED        34    /* Max speed limit (default 0x28) */
 #define SR_ACCEL_LO         35    /* Acceleration low byte */
 #define SR_ACCEL_HI         36    /* Acceleration high byte */

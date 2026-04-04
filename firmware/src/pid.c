@@ -29,6 +29,7 @@ extern uint32_t position_linearize(uint32_t position);
 void pid_full_compute(uint8_t *param);
 void pid_speed_compute(uint8_t *param);
 void pid_current_compute(uint8_t *param);
+void pid_cascaded_current(uint8_t *param, int16_t current_goal);
 void position_pid_reset(uint8_t *state);
 void speed_pid_reset(uint8_t *state);
 
@@ -626,6 +627,7 @@ void __attribute__((noinline)) motor_output_apply(uint8_t *adc_st)
         if (mode == 3) goto position_mode;
         if (mode == 1) goto speed_mode;
         if (mode == 4) goto current_mode;
+        if (mode == 5) goto position_current_mode;
         /* PWM mode (mode 2): output is handled by motor_safety_apply
          * in Step 3 (calls pwm_mode_compute + pwm_apply_output).
          * TODO: PWM mode doesn't drive motor — needs investigation. */
@@ -684,6 +686,53 @@ current_mode:
     {
         uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
         if (torque_enable != 1) {
+            speed_pid_reset(pid_state_arr);
+        }
+        pwm_apply_output(timer_ctrl_arr,
+                         (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
+                         (int32_t)torque_enable, 0);
+    }
+    return;
+
+position_current_mode:
+    /* Cascaded position/current mode (mode 5).
+     *
+     * Outer loop: position PID computes a torque command from position error.
+     * Inner loop: current PID regulates actual motor current to match.
+     *
+     * This gives position control with a physics-guaranteed force limit:
+     * the current loop measures and enforces the force regardless of motor
+     * speed, voltage, or temperature. A stalled motor draws exactly the
+     * commanded current, no more.
+     *
+     * Flow: position PID → PWM_OUTPUT (torque command) → current PID goal
+     *       → current PID → PWM_OUTPUT (duty) → motor */
+    position_motion_guard(pid_state_arr);
+    pid_full_compute(pid_state_arr + PID_POS_BASE);
+
+    /* Feed position PID output as the current goal with friction
+     * compensation. The position PID output (max_output) controls
+     * compliance softness. Friction feedforward adds a fixed offset
+     * in the direction of motion to overcome gear stiction, so the
+     * motor can return to position even with low max_output. */
+    {
+        int16_t torque_cmd = *(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT);
+        if (torque_cmd != 0) {
+            /* Add friction compensation from SR_PUNCH_MIN register */
+            volatile uint8_t *sr = servo_regs;
+            int16_t friction = (int16_t)(uint16_t)sr[SR_PUNCH_MIN];
+            if (torque_cmd > 0)
+                torque_cmd += friction;
+            else
+                torque_cmd -= friction;
+        }
+        pid_cascaded_current(encoder_i2c_arr + EI2C_SPEED_STATE, torque_cmd);
+    }
+
+    {
+        uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
+        if (torque_enable != 1) {
+            position_pid_reset(pid_state_arr);
             speed_pid_reset(pid_state_arr);
         }
         pwm_apply_output(timer_ctrl_arr,
@@ -881,6 +930,60 @@ void __attribute__((noinline)) pid_current_compute(uint8_t *param)
     }
 
     volatile uint8_t *pc = pwm_ctrl;
+    *(int16_t *)(pc + PWM_OUTPUT) = result;
+    s[2] = output - (int32_t)result;  /* Anti-windup */
+}
+
+/* Cascaded current PID — inner loop for mode 5.
+ * Same as pid_current_compute but reads goal from the parameter
+ * (position PID output) instead of servo registers. */
+void __attribute__((noinline)) pid_cascaded_current(uint8_t *param, int16_t current_goal)
+{
+    int32_t *s = (int32_t *)param;
+
+    volatile uint8_t *sr = servo_regs;
+    if (sr[SR_TORQUE_ENABLE] != 1) {
+        s[1] = 0;
+        s[2] = 0;
+        return;
+    }
+
+    /* Zero goal → zero output */
+    if (current_goal == 0) {
+        s[0] = 0;
+        s[1] = 0;
+        s[2] = 0;
+        volatile uint8_t *pc = pwm_ctrl;
+        *(int16_t *)(pc + PWM_OUTPUT) = 0;
+        return;
+    }
+
+    /* Error = goal - actual current.
+     * P-only inner loop (no integrator) — the outer position PID's
+     * integrator compensates for steady-state droop. P-only gives
+     * fast response with minimal phase lag, preventing oscillation
+     * in the cascaded system. */
+    volatile uint8_t *pc = pwm_ctrl;
+    int32_t actual = (int32_t)*(int16_t *)(pc + PWM_CURRENT_SENSE);
+    s[0] = (int32_t)current_goal - actual;
+
+    int32_t output = pid_spd_pterm(s);
+
+    /* Clamp to max output */
+    sr = servo_regs;
+    int16_t max_torque = *(int16_t *)(sr + SR_MAX_OUTPUT_LO);
+    int16_t neg_max = -max_torque;
+    int16_t result;
+
+    if (output < (int32_t)neg_max) {
+        result = neg_max;
+    } else if (output > (int32_t)max_torque) {
+        result = max_torque;
+    } else {
+        result = (int16_t)output;
+    }
+
+    pc = pwm_ctrl;
     *(int16_t *)(pc + PWM_OUTPUT) = result;
     s[2] = output - (int32_t)result;  /* Anti-windup */
 }
