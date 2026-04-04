@@ -15,7 +15,7 @@ An open-source, clean-room reimplementation of the Feetech STS3215 servo motor f
 | Binary size | 15.6 KB (factory: 16.8 KB) |
 | Bugs found & fixed | 24 |
 
-All motor modes work: position (PID), speed (continuous rotation), PWM (direct drive), and multi-turn. Cold boot PWM startup in all 4 directions verified.
+All motor modes work: position (PID), speed (continuous rotation), PWM (direct drive), multi-turn, and current/torque control (mode 4 — new, not in factory firmware). Cold boot PWM startup in all 4 directions verified.
 
 ### Step Response Comparison
 

@@ -28,6 +28,7 @@ extern uint32_t position_linearize(uint32_t position);
 /* Forward declarations within this file */
 void pid_full_compute(uint8_t *param);
 void pid_speed_compute(uint8_t *param);
+void pid_current_compute(uint8_t *param);
 void position_pid_reset(uint8_t *state);
 void speed_pid_reset(uint8_t *state);
 
@@ -624,6 +625,7 @@ void __attribute__((noinline)) motor_output_apply(uint8_t *adc_st)
     if (mode != 0) {
         if (mode == 3) goto position_mode;
         if (mode == 1) goto speed_mode;
+        if (mode == 4) goto current_mode;
         /* PWM mode (mode 2): output is handled by motor_safety_apply
          * in Step 3 (calls pwm_mode_compute + pwm_apply_output).
          * TODO: PWM mode doesn't drive motor — needs investigation. */
@@ -657,6 +659,28 @@ speed_mode:
     pid_speed_compute(encoder_i2c_arr + EI2C_SPEED_STATE);
     speed_stall_check(timer_ctrl_arr + TMR_MOTION_BASE);
     motor_safety_halt();
+    {
+        uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
+        if (torque_enable != 1) {
+            speed_pid_reset(pid_state_arr);
+        }
+        pwm_apply_output(timer_ctrl_arr,
+                         (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
+                         (int32_t)torque_enable, 0);
+    }
+    return;
+
+current_mode:
+    /* Current (torque) control mode — closes the loop on motor current.
+     * Reuses the speed PID state area (EI2C_SPEED_STATE) since current
+     * and speed modes are mutually exclusive.
+     *
+     * No speed_stall_check: stall detection assumes "not moving = fault",
+     * but in current mode, holding position under load (e.g. gravity
+     * compensation) is intentional and normal. Overcurrent protection
+     * via overload_protect() in Step 3 is the correct safety mechanism
+     * for current mode — it monitors actual current draw, not movement. */
+    pid_current_compute(encoder_i2c_arr + EI2C_SPEED_STATE);
     {
         uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
         if (torque_enable != 1) {
@@ -769,6 +793,96 @@ void __attribute__((noinline)) pid_speed_compute(uint8_t *param)
     volatile uint8_t *pc = pwm_ctrl;
     *(int16_t *)(pc + PWM_OUTPUT) = result;
     s[2] = output - (int32_t)result;  /* integrator anti-windup */
+}
+
+/* ================================================================
+ * Current (torque) PID — mode 4.
+ *
+ * Closes the loop on motor current measured by the ADC shunt resistor.
+ * Goal current comes from servo_regs[44-45] (PWM goal registers, reused
+ * as current goal in sign-magnitude format, same as PWM mode).
+ * Feedback is PWM_CURRENT_SENSE (ADC delta from baseline).
+ *
+ * Uses PI control (same structure as speed PID):
+ *   P = error * Kp / 10        (Kp from SR_KI_SPEED register 37)
+ *   I = integrator * Ki / 1000 (Ki from SR_OVERLOAD_RATIO register 39)
+ *
+ * State layout (reuses speed PID state at EI2C_SPEED_STATE):
+ *   s[0] = error, s[1] = I-term integrator, s[2] = prev error
+ * ================================================================ */
+
+/* Current error = goal_current - actual_current. */
+static void __attribute__((noinline)) pid_cur_error(int32_t *s)
+{
+    volatile uint8_t *sr = servo_regs;
+    volatile uint8_t *pc = pwm_ctrl;
+
+    /* Read goal from PWM goal registers (sign-magnitude, bit 10 = sign) */
+    uint16_t raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
+    int32_t goal;
+    if (raw & PWM_GOAL_SIGN_BIT) {
+        goal = -(int32_t)(raw & ~(uint16_t)PWM_GOAL_SIGN_BIT);
+    } else {
+        goal = (int32_t)raw;
+    }
+
+    /* Read actual current from ADC */
+    int32_t actual = (int32_t)*(int16_t *)(pc + PWM_CURRENT_SENSE);
+
+    s[0] = goal - actual;
+}
+
+/* Current PID compute — PI controller on motor current. */
+void __attribute__((noinline)) pid_current_compute(uint8_t *param)
+{
+    int32_t *s = (int32_t *)param;
+
+    volatile uint8_t *sr = servo_regs;
+    if (sr[SR_TORQUE_ENABLE] != 1) {
+        s[1] = 0;
+        s[2] = 0;
+        return;
+    }
+
+    /* If goal is zero, output zero immediately — no PID needed.
+     * This prevents ADC noise from causing integrator wind-up. */
+    sr = servo_regs;
+    uint16_t goal_raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
+    if ((goal_raw & ~(uint16_t)PWM_GOAL_SIGN_BIT) == 0) {
+        s[0] = 0;
+        s[1] = 0;
+        s[2] = 0;
+        volatile uint8_t *pc = pwm_ctrl;
+        *(int16_t *)(pc + PWM_OUTPUT) = 0;
+        return;
+    }
+
+    pid_cur_error(s);
+    pid_spd_iterm_integrate(s);
+    int32_t p = pid_spd_pterm(s);
+    int32_t i = pid_spd_iterm(s);
+
+    int32_t output = p + i;
+
+    s[2] = s[0];
+
+    /* Clamp to max output */
+    sr = servo_regs;
+    int16_t max_torque = *(int16_t *)(sr + SR_MAX_OUTPUT_LO);
+    int16_t neg_max = -max_torque;
+    int16_t result;
+
+    if (output < (int32_t)neg_max) {
+        result = neg_max;
+    } else if (output > (int32_t)max_torque) {
+        result = max_torque;
+    } else {
+        result = (int16_t)output;
+    }
+
+    volatile uint8_t *pc = pwm_ctrl;
+    *(int16_t *)(pc + PWM_OUTPUT) = result;
+    s[2] = output - (int32_t)result;  /* Anti-windup */
 }
 
 /* Reset PID state by zeroing all motion helper fields. */
