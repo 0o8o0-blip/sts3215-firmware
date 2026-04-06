@@ -671,15 +671,11 @@ speed_mode:
     return;
 
 current_mode:
-    /* Current (torque) control mode — closes the loop on motor current.
-     * Reuses the speed PID state area (EI2C_SPEED_STATE) since current
-     * and speed modes are mutually exclusive.
-     *
-     * No speed_stall_check: stall detection assumes "not moving = fault",
-     * but in current mode, holding position under load (e.g. gravity
-     * compensation) is intentional and normal. Overcurrent protection
-     * via overload_protect() in Step 3 is the correct safety mechanism
-     * for current mode — it monitors actual current draw, not movement. */
+    /* Current (torque) control mode — closed-loop force control.
+     * PI regulates motor current to match goal via ON-phase sensing.
+     * Goal: SR_PWM_GOAL_LO (reg 44), 12-bit raw ADC units.
+     * Gains: SR_CURRENT_KP (reg 50, uint16), SR_CURRENT_KI (reg 52, uint16).
+     * Typical values: Kp=3, Ki=50 for 12-bit scale. */
     pid_current_compute(encoder_i2c_arr + EI2C_SPEED_STATE);
     {
         uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
@@ -815,7 +811,6 @@ void __attribute__((noinline)) pid_speed_compute(uint8_t *param)
 static void __attribute__((noinline)) pid_cur_error(int32_t *s)
 {
     volatile uint8_t *sr = servo_regs;
-    volatile uint8_t *pc = pwm_ctrl;
 
     /* Read goal from PWM goal registers (sign-magnitude, bit 10 = sign) */
     uint16_t raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
@@ -826,8 +821,11 @@ static void __attribute__((noinline)) pid_cur_error(int32_t *s)
         goal = (int32_t)raw;
     }
 
-    /* Read actual current from ADC */
-    int32_t actual = (int32_t)*(int16_t *)(pc + PWM_CURRENT_SENSE);
+    /* Read actual current from ON-phase oversampling.
+     * Full 12-bit resolution (0-4095). PI gains should be set
+     * ~4x lower than factory defaults for this scale. */
+    extern volatile uint16_t adc_on_phase_peak;
+    int32_t actual = (int32_t)adc_on_phase_peak;
 
     s[0] = goal - actual;
 }
@@ -858,9 +856,28 @@ void __attribute__((noinline)) pid_current_compute(uint8_t *param)
     }
 
     pid_cur_error(s);
-    pid_spd_iterm_integrate(s);
-    int32_t p = pid_spd_pterm(s);
-    int32_t i = pid_spd_iterm(s);
+
+    /* Current PI uses dedicated registers (SR_CURRENT_KP/KI)
+     * instead of shared speed PID registers. */
+    {
+        /* I-term integrate */
+        int32_t ki = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KI_LO);
+        if (ki == 0) { s[1] = 0; }
+        else { s[1] += s[0] - s[2]; }
+    }
+    int32_t p, i;
+    {
+        /* P-term = error * Kp / 10 */
+        int32_t kp = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KP_LO);
+        int32_t val = s[0] * kp;
+        p = (int32_t)(((int64_t)0x66666667 * (int64_t)val) >> 34) - (val >> 31);
+    }
+    {
+        /* I-term = integrator * Ki / 1000 */
+        int32_t ki = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KI_LO);
+        int32_t val = s[1] * ki;
+        i = (int32_t)(((int64_t)0x10624dd3 * (int64_t)val) >> 38) - (val >> 31);
+    }
 
     int32_t output = p + i;
 

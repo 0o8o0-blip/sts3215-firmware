@@ -132,10 +132,10 @@
 #define SR_GOAL_SPEED_HI    47    /* 0x2F: goal speed high byte */
 #define SR_MAX_OUTPUT_LO    48    /* 0x30: max output torque low byte */
 #define SR_MAX_OUTPUT_HI    49    /* 0x31: max output torque high byte */
-#define SR_RESERVED_32      50
-#define SR_RESERVED_33      51
-#define SR_RESERVED_34      52
-#define SR_RESERVED_35      53
+#define SR_CURRENT_KP_LO    50    /* 0x32: mode 4 current PI P-gain (uint16) */
+#define SR_CURRENT_KP_HI    51
+#define SR_CURRENT_KI_LO    52    /* 0x34: mode 4 current PI I-gain (uint16) */
+#define SR_CURRENT_KI_HI    53
 #define SR_RESERVED_36      54
 #define SR_LOCK             55    /* 0x37: lock flag (non-zero skips side effects) */
 #define SR_PRESENT_POS_LO  56    /* 0x38: present position low (RO) */
@@ -289,6 +289,11 @@
  * ================================================================ */
 #define I2C_VTABLE           0    /* uint32_t: vtable pointer */
 #define I2C_DMA_BUF          4    /* uint16_t[4]: ADC DMA buffer (8 bytes) */
+#define I2C_ADC_CFG       0x14    /* uint8_t[8]: ADC pin config (PA0-PA7) */
+#define I2C_ADC_PA1       0x15    /* PA1 (temperature NTC) */
+#define I2C_ADC_PA3       0x17    /* PA3 (current shunt) */
+#define I2C_ADC_PA4       0x18    /* PA4 (voltage divider) */
+#define I2C_ADC_PA5       0x19    /* PA5 (I2C encoder mode) */
 #define I2C_TEMP_FILTER     0x24  /* uint8_t[4]: temperature filter state */
 #define I2C_CURR_BASELINE   0x26  /* int16_t: current sensor baseline */
 #define I2C_WARMUP_CTR      0x28  /* int8_t: warmup counter */
