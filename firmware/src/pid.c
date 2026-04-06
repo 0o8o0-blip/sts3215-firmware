@@ -626,6 +626,7 @@ void __attribute__((noinline)) motor_output_apply(uint8_t *adc_st)
         if (mode == 3) goto position_mode;
         if (mode == 1) goto speed_mode;
         if (mode == 4) goto current_mode;
+        if (mode == 5) goto compliant_position_mode;
         /* PWM mode (mode 2): output is handled by motor_safety_apply
          * in Step 3 (calls pwm_mode_compute + pwm_apply_output).
          * TODO: PWM mode doesn't drive motor — needs investigation. */
@@ -686,6 +687,64 @@ current_mode:
                          (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
                          (int32_t)torque_enable, 0);
     }
+    return;
+
+compliant_position_mode:
+    /* Compliant position mode (mode 5).
+     *
+     * Position PID drives duty (like mode 0) with:
+     *   - Holding force baseline from SR_HOLDING_FORCE (reg 54)
+     *   - Compliance range: PID clamped to (max_output - holding)
+     *   - Current safety clamp: reduces duty if measured current
+     *     exceeds max_output (uses ON-phase peak from mode 4/5 sensing)
+     *
+     * Holding force provides gravity compensation. PID adds/subtracts
+     * for position correction. Max_output caps the total.
+     *
+     * Flow: position PID → duty + holding → current clamp → motor */
+    position_motion_guard(pid_state_arr);
+    pid_full_compute(pid_state_arr + PID_POS_BASE);
+
+    {
+        int16_t pid_out = *(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT);
+        volatile uint8_t *sr = servo_regs;
+        int16_t holding = (int16_t)(uint32_t)sr[SR_HOLDING_FORCE];
+        int16_t max_out = *(int16_t *)(sr + SR_MAX_OUTPUT_LO);
+
+        /* Clamp PID output to compliance range */
+        int32_t compliance = (int32_t)max_out - (int32_t)holding;
+        if (compliance < 0) compliance = 0;
+        int32_t pid = (int32_t)pid_out;
+        if (pid > compliance) pid = compliance;
+        if (pid < -compliance) pid = -compliance;
+
+        /* Total = holding baseline + compliance PID */
+        int32_t total = (int32_t)holding + pid;
+
+        /* Current safety clamp: if measured current exceeds threshold,
+         * scale duty down proportionally. */
+        extern volatile uint16_t adc_on_phase_peak;
+        int32_t current = (int32_t)adc_on_phase_peak;
+        int32_t current_limit = (int32_t)max_out * 4;
+        if (current > current_limit && current_limit > 0) {
+            total = total * current_limit / current;
+        }
+
+        /* Write final duty */
+        *(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT) = (int16_t)total;
+    }
+
+    {
+        uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
+        if (torque_enable != 1) {
+            position_pid_reset(pid_state_arr);
+            speed_pid_reset(pid_state_arr);
+        }
+        pwm_apply_output(timer_ctrl_arr,
+                         (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
+                         (int32_t)torque_enable, 0);
+    }
+    return;
 }
 
 /* ================================================================
@@ -921,6 +980,11 @@ static void __attribute__((noinline)) pid_pos_error_update(int32_t *s)
     int32_t actual = *(int32_t *)(pc + PWM_ENCODER_POS);
     int32_t goal = *(int32_t *)(pc + PWM_GOAL_POS);
     int32_t error = actual - goal;  /* original: encoder - goal (not goal - encoder) */
+    /* Wrap error for 12-bit encoder: take shortest path.
+     * Without this, pushing past the 0/4095 boundary makes the PID
+     * drive the wrong way. Only in standard position mode. */
+    if (error > 2048) error -= 4096;
+    if (error < -2048) error += 4096;
     volatile uint8_t *sr = servo_regs;
     int32_t neg_dz = -(int32_t)(uint32_t)sr[SR_CCW_DEADZONE];
 

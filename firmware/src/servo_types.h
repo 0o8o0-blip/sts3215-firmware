@@ -136,7 +136,7 @@
 #define SR_CURRENT_KP_HI    51
 #define SR_CURRENT_KI_LO    52    /* 0x34: mode 4 current PI I-gain (uint16) */
 #define SR_CURRENT_KI_HI    53
-#define SR_RESERVED_36      54
+#define SR_HOLDING_FORCE    54    /* 0x36: mode 5 gravity comp holding force (uint8) */
 #define SR_LOCK             55    /* 0x37: lock flag (non-zero skips side effects) */
 #define SR_PRESENT_POS_LO  56    /* 0x38: present position low (RO) */
 #define SR_PRESENT_POS_HI  57    /* 0x39: present position high (RO) */
