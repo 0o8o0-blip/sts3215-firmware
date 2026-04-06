@@ -1220,6 +1220,13 @@ class GoldenPeriphTests:
         self.uc.mem_write(servo_regs + 44, struct.pack('<H', 100))
         self.uc.mem_write(servo_regs + 48, struct.pack('<H', 1000))
         self.uc.mem_write(pwm_ctrl + 0x14, struct.pack('<h', 0))
+        # Set current PI gains (dedicated registers, not shared with speed PID)
+        self.uc.mem_write(servo_regs + 50, struct.pack('<H', 10))   # SR_CURRENT_KP
+        self.uc.mem_write(servo_regs + 52, struct.pack('<H', 200))  # SR_CURRENT_KI
+        # Zero the ON-phase peak global (mode 4 reads this, not PWM_CURRENT_SENSE)
+        peak_addr = self.syms.get('adc_on_phase_peak', 0)
+        if peak_addr:
+            self.uc.mem_write(peak_addr, struct.pack('<H', 0))
         self.uc.mem_write(state_addr, b'\x00' * 12)
 
         _, sram, _ = self.call(addr, [state_addr])
@@ -1230,7 +1237,12 @@ class GoldenPeriphTests:
                    output == 120, f'got {output}')
 
         # Goal = actual → output = 0
-        self.uc.mem_write(pwm_ctrl + 0x14, struct.pack('<h', 100))
+        # Mode 4 reads from adc_on_phase_peak global, not PWM_CURRENT_SENSE
+        peak_addr = self.syms.get('adc_on_phase_peak', 0)
+        if peak_addr:
+            self.uc.mem_write(peak_addr, struct.pack('<H', 100))
+        else:
+            self.uc.mem_write(pwm_ctrl + 0x14, struct.pack('<h', 100))
         self.uc.mem_write(state_addr, b'\x00' * 12)
         _, sram, _ = self.call(addr, [state_addr])
         output = struct.unpack_from('<h', sram, pwm_ctrl - SRAM_BASE + 6)[0]

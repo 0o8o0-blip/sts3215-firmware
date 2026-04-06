@@ -170,7 +170,7 @@ void __attribute__((noinline)) i2c_hw_init(uint8_t *param)
     uint32_t pin_idx = 0;
     int i = 0;
     uint32_t bit_pos = 1;
-    char *pcfg = (char *)(param + 0x14);
+    char *pcfg = (char *)(param + I2C_ADC_CFG);
 
     do {
         if (*pcfg != '\0') {
@@ -213,38 +213,60 @@ void __attribute__((noinline)) i2c_hw_init(uint8_t *param)
     /* Configure peripheral transfer count */
     periph[0x2C/4] |= (pin_idx - 1) * 0x100000;
 
-    /* Configure peripheral timing/control */
-    periph[0x04/4] |= 0x100;
-    periph[0x08/4] |= 0x1E0100;
-    periph[0x08/4] |= 1;
-    periph[0x08/4] |= 8;
+    /* Configure ADC trigger and control.
+     * CTL0: SCAN mode (multiple channels per trigger)
+     * CTL1: ETSRC=001 (TIMER0_CH1), ETERC=1 (external trigger enable)
+     *        ADON=1. No continuous mode — timer triggers each scan.
+     *
+     * TIMER0 CH1 fires once per PWM cycle at a configurable point,
+     * triggering one ADC scan that captures current during the ON phase. */
+    periph[0x04/4] |= 0x100;                /* CTL0: SCAN */
+    periph[0x08/4] |= (0x01 << 17) | (1 << 20); /* CTL1: ETSRC=001(TIMER0_CH1), ETERC=1 */
+    periph[0x08/4] |= 1;                    /* ADON */
+    periph[0x08/4] |= 8;                    /* RSTCLB */
 
-    /* Wait for reset to complete */
+    /* Wait for calibration reset */
     while ((periph[0x08/4] & 8) != 0) { }
 
-    /* Send stop/sync */
+    /* Calibration */
     periph[0x08/4] |= 4;
     while ((periph[0x08/4] & 4) != 0) { }
 
-    /* Configure DMA channel 0 */
+    /* Configure DMA channel 0 for single scan (3 channels) */
     volatile uint32_t *dma_ch0 = (volatile uint32_t *)DMA_CH0_BASE;
-    dma_ch0[2] = 0x4001244CU;             /* PADDR: peripheral data register */
-    dma_ch0[3] = (uint32_t)(param + 4);   /* MADDR: receive buffer in param */
-    *dma_ch0 = 0x15A0;                     /* CTL: circular, periph-to-mem, halfword */
-    dma_ch0[1] = pin_idx;                  /* CNT: number of channels */
+    dma_ch0[2] = 0x4001244CU;             /* PADDR: ADC regular data */
+    dma_ch0[3] = (uint32_t)(param + 4);   /* MADDR: DMA buffer in i2c_ctrl */
+    *dma_ch0 = 0x1580;                     /* CTL: single-shot, periph-to-mem, halfword */
+    dma_ch0[1] = pin_idx;                  /* CNT: 3 channels */
 
-    /* Clear DMA channel 0 transfer complete flag (DMA_INTC) */
+    /* Clear DMA channel 0 transfer complete flag */
     *(volatile uint32_t *)(DMA_BASE + 4) = 2;
 
     /* Enable DMA channel */
     *dma_ch0 |= 1;
 
-    /* Start ADC continuous conversion.
-     * Set CTN (bit 1) for continuous mode, then SWRCST (bit 22) to trigger.
-     * Original configures this during init so ADC runs continuously and
-     * DMA circularly transfers the channel readings to i2c_ctrl buffer. */
-    periph[0x08/4] |= 2;          /* CTL1: CTN = continuous mode */
-    periph[0x08/4] |= 0x400000;   /* CTL1: SWRCST = start conversion */
+    /* Enable ADC DMA mode (bit 8) and start first conversion. */
+    periph[0x08/4] |= (1 << 8);   /* CTL1: DMA enable */
+
+    /* Configure TIMER0 CH1 as internal trigger for ADC.
+     * CH1 in output compare mode, no GPIO output.
+     * CH1CV = 10 (trigger early in ON phase). Updated at runtime. */
+    {
+        volatile uint32_t *timer0 = (volatile uint32_t *)0x40012C00U;
+        /* CHCTL0: CH1 bits [14:12] = 000 (frozen/compare), no output.
+         * Don't touch CH0 bits [6:4] (PWM mode for motor). */
+        uint32_t chctl0 = timer0[0x18/4];
+        chctl0 &= 0x00FF;          /* keep CH0 config */
+        chctl0 |= 0x3000;          /* CH1: OC mode 011 = toggle (generates event) */
+        timer0[0x18/4] = chctl0;
+
+        /* CH1CV: trigger point = 10 (near start of ON phase) */
+        timer0[0x38/4] = 10;
+
+        /* Enable CH1 compare event: CHCTL2 bit 4 = CH1E */
+        timer0[0x20/4] |= 0x0010;
+    }
+
 }
 
 /* I2C0 event IRQ handler. */
@@ -316,6 +338,13 @@ uint32_t __attribute__((noinline)) i2c_data_ready(uint8_t *ctrl)
     volatile uint32_t *dma = (volatile uint32_t *)DMA_BASE;
     if ((dma[0] & 2) != 0) {
         dma[1] = 2;  /* Clear FTFIF0 via DMA_INTC */
+
+
+        /* Re-arm DMA for next trigger */
+        volatile uint32_t *dma_ch0 = (volatile uint32_t *)DMA_CH0_BASE;
+        *dma_ch0 &= ~1U;  /* Disable channel */
+        dma_ch0[1] = 3;   /* Reset CNT to 3 */
+        *dma_ch0 |= 1;    /* Re-enable */
         return 1;
     }
     return 0;
@@ -473,17 +502,17 @@ void __attribute__((noinline)) i2c_mode_init(uint8_t *param)
 {
     if (servo_regs_arr[SR_CONFIG] & 0x20) {
         /* I2C encoder mode */
-        param[0x17] = 1;
-        param[0x19] = 1;
-        param[0x18] = 1;
+        param[I2C_ADC_PA3] = 1;
+        param[I2C_ADC_PA5] = 1;
+        param[I2C_ADC_PA4] = 1;
         param[I2C_TEMP_CH] = 2;
         param[I2C_CURR_CH] = 1;
         param[I2C_VOLT_CH] = 0;
     } else {
-        /* ADC mode */
-        param[0x18] = 1;
-        param[0x15] = 1;
-        param[0x17] = 1;
+        /* ADC mode: PA1=temp, PA3=current, PA4=voltage */
+        param[I2C_ADC_PA4] = 1;
+        param[I2C_ADC_PA1] = 1;
+        param[I2C_ADC_PA3] = 1;
         param[I2C_TEMP_CH] = 0;
         param[I2C_CURR_CH] = 1;
         param[I2C_VOLT_CH] = 2;

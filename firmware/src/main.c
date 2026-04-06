@@ -588,6 +588,9 @@ void __attribute__((noinline, section(".text.keep"))) encoder_track_multiturn(in
     enc_state[1] = current + enc_state[2] * ENCODER_FULL_REV;
 }
 
+/* ON-phase current peak — written by Step 1 oversampling, read by mode 4 PID */
+volatile uint16_t adc_on_phase_peak;
+
 /* Main tick — called every iteration of the main loop. */
 void __attribute__((noinline)) main_tick(void)
 {
@@ -597,15 +600,62 @@ void __attribute__((noinline)) main_tick(void)
      * Phase1 set → goto Step4_check
      * Step4_check: if PHASE0, step4; else step5 */
 
-    /* Step 1: Check TIMER0 update interrupt for tick */
+    /* Step 1: Check TIMER0 update interrupt for tick.
+     * Timer update = start of ON phase. Oversample current here. */
     {
         uint32_t result = timer_tick_elapsed(timer_ctrl_arr);
         if (result != 0) {
+            /* ON-phase current oversampling (mode 4/5 only).
+             * At the start of each PWM cycle, briefly switch ADC to
+             * software trigger + current channel only, take one sample,
+             * restore. This captures peak ON-phase current even at low duty.
+             *
+             * GD32F130 has no injected ADC channels (reserved registers).
+             * SWRCST requires ETSRC=111 (software trigger mode).
+             * ARM bit-banding writes individual CTL1 bits without
+             * re-writing ADON, which would trigger spurious conversions.
+             *
+             * Bit-band addresses for ADC CTL1 (0x40012408):
+             *   DMA    (bit 8):  0x42248120
+             *   ETSRC1 (bit 18): 0x42248148
+             *   ETSRC2 (bit 19): 0x4224814C
+             *   SWRCST (bit 22): 0x42248158 */
+            if (servo_regs_arr[SR_OPERATING_MODE] >= 4) {
+                volatile uint32_t *adc = (volatile uint32_t *)0x40012400U;
+
+                /* Save RSQ, switch to software trigger + CH3 only */
+                uint32_t rsq0_save = adc[0x2C/4];
+                uint32_t rsq2_save = adc[0x34/4];
+                *(volatile uint32_t *)0x42248120U = 0U;  /* DMA=0 */
+                *(volatile uint32_t *)0x42248148U = 1U;  /* ETSRC1=1 */
+                *(volatile uint32_t *)0x4224814CU = 1U;  /* ETSRC2=1 */
+                adc[0x2C/4] = 0;   /* RL=0 (1 channel) */
+                adc[0x34/4] = 3;   /* RSQ2 pos0 = CH3 */
+
+                /* Flush: first conversion after ETSRC switch reads stale
+                 * data from the old scan position. Discard it. */
+                *(volatile uint32_t *)0x42248158U = 1U;
+                for (int w = 0; w < 100; w++) { if (adc[0] & 2) break; }
+                (void)adc[0x4C/4];
+                adc[0] &= ~2U;
+
+                /* Sample current at start of ON phase */
+                *(volatile uint32_t *)0x42248158U = 1U;
+                for (int w = 0; w < 100; w++) { if (adc[0] & 2) break; }
+                if (adc[0] & 2) {
+                    adc_on_phase_peak = (uint16_t)(adc[0x4C/4] & 0xFFF);
+                    adc[0] &= ~2U;
+                }
+
+                /* Restore RSQ and trigger mode */
+                adc[0x34/4] = rsq2_save;
+                adc[0x2C/4] = rsq0_save;
+                *(volatile uint32_t *)0x42248148U = 0U;
+                *(volatile uint32_t *)0x4224814CU = 0U;
+                *(volatile uint32_t *)0x42248120U = 1U;  /* DMA=1 */
+            }
+
             encoder_start_read(encoder_ctrl_arr);
-            /* Restart ADC conversion (SWRCST) — original calls 0x1308 */
-            volatile uint32_t *adc_ctl1 = (volatile uint32_t *)(0x40012400 + 0x08);
-            *adc_ctl1 |= 0x00400000U;
-            /* Original: b F66 — goto Step 2 check (falls through naturally) */
         }
     }
 
