@@ -146,6 +146,18 @@ def main():
     if args.firmware:
         print(f"Loading firmware from {args.firmware}...")
         fw_enc = open(args.firmware, 'rb').read()
+        # Auto-encrypt raw .bin files (same fix as flash_tool.py)
+        if args.firmware.endswith(".bin"):
+            try:
+                from encrypt import encrypt_firmware
+                print("  Encrypting for bootloader...")
+                fw_enc = encrypt_firmware(fw_enc)
+                print(f"  Encrypted: {len(fw_enc)} bytes")
+            except ImportError:
+                print("Error: encrypt.py or pycryptodome not found.")
+                print("Cannot flash unencrypted .bin — bootloader would decrypt to garbage.")
+                print("Install: pip install pycryptodome")
+                sys.exit(1)
     else:
         print("Loading factory firmware...")
         fw_enc = find_factory_firmware()

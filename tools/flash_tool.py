@@ -738,6 +738,22 @@ Examples:
                 with open(args.firmware, "rb") as f:
                     fw_data = f.read()
                 print(f"  Loaded {len(fw_data)} bytes")
+
+                # Auto-encrypt raw .bin files for the bootloader.
+                # Server-downloaded firmware is already encrypted, but local
+                # builds are plaintext. The bootloader always decrypts, so
+                # sending unencrypted data results in garbage.
+                if args.firmware.endswith(".bin"):
+                    try:
+                        from encrypt import encrypt_firmware
+                        print("  Encrypting for bootloader...")
+                        fw_data = encrypt_firmware(fw_data)
+                        print(f"  Encrypted: {len(fw_data)} bytes")
+                    except ImportError:
+                        print("Error: encrypt.py or pycryptodome not found.")
+                        print("Cannot flash unencrypted .bin — bootloader would decrypt to garbage.")
+                        print("Install: pip install pycryptodome")
+                        sys.exit(1)
             else:
                 # Download from server
                 print(f"\nDownloading firmware for model {version_str}...")
