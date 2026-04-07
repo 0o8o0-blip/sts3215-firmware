@@ -405,11 +405,16 @@ void uart_dispatch(uint8_t *state)
         handle_write((uint32_t *)state, state + UART_PACKET_BUF);
         break;
     case INST_BOOTLOADER:   /* 0x08 */
-        /* System reset to enter bootloader via vtable[2] */
+        /* Jump to the Feetech bootloader at 0x08007800.
+         * The original vtable[2] call just switches UART mode —
+         * it never actually enters the bootloader. Jump directly
+         * so flash_tool can update firmware without power cycling. */
         {
-            typedef void (*boot_fn_t)(void);
-            boot_fn_t fn = (boot_fn_t)(*(uint32_t *)(*(uint32_t *)state + 8));
-            fn();
+            __asm__ volatile("cpsid i");
+            uint32_t bl_sp    = *(volatile uint32_t *)0x08007800U;
+            uint32_t bl_entry = *(volatile uint32_t *)0x08007804U;
+            __asm__ volatile("msr msp, %0" :: "r"(bl_sp));
+            ((void (*)(void))bl_entry)();
         }
         break;
     case INST_SYNC_WRITE:   /* 0x83 */
