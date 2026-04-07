@@ -301,21 +301,16 @@ def enter_bootloader(ser, servo_id, bus_baudrate=1000000, mode="software"):
 
     else:
         # === Path B: Software mode (generic USB-serial adapters) ===
-        # From FD.exe 0x40FE50: sends servo_id byte at current baud before switching
-        # When [esi+0x24C] == 2: sends servo_id byte via main send function
-        ser.write(bytes([servo_id]))
-        ser.flush()
-        time.sleep(0.01)
-
-        # Switch to bootloader baud rate
+        # The firmware's instruction 0x08 handler jumps directly to the
+        # Feetech bootloader at 0x08007800. Switch to 500k immediately
+        # since the bootloader communicates at that baud rate.
         ser.baudrate = 500000
-        time.sleep(0.1)  # Sleep(100) in FD.exe
+        time.sleep(0.05)
 
-        # Set read timeout (500ms in FD.exe: SetCommTimeouts)
         ser.timeout = 0.5
         ser.reset_input_buffer()
 
-        print("  Bootloader entry sent (software mode, no 'C' wait)")
+        print("  Bootloader entry sent (software mode)")
         return True
 
 
