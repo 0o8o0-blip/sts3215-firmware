@@ -126,11 +126,25 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
      * After check, version is always set to {3, 10, 0, 9}. */
     if (sr[0] != 3 || sr[3] != 9) {
         servo_defaults_init();
+        sr[0] = 3;
+        sr[1] = 10;
+        sr[2] = 0;
+        sr[3] = 9;
+        /* Sync defaults + version back to EEPROM working buffer.
+         * Without this, the working buffer retains 0xFF from the
+         * erased/invalid page, and any subsequent EEPROM save writes
+         * corrupted version headers — causing defaults to reload on
+         * every boot and making register writes non-persistent. */
+        buf_to_regs(ec, sr + param[EE_GRP_START_BASE],
+                    param[EE_GRP_OFFSET_BASE], param[EE_GRP_SIZE_BASE]);
+        buf_to_regs(ec, sr + param[EE_GRP_START1],
+                    param[EE_GRP_OFFSET_BASE + 1], param[EE_GRP_SIZE2_BASE]);
+    } else {
+        sr[0] = 3;
+        sr[1] = 10;
+        sr[2] = 0;
+        sr[3] = 9;
     }
-    sr[0] = 3;    /* firmware major: 3 (matches original) */
-    sr[1] = 10;   /* firmware minor: 10 */
-    sr[2] = 0;    /* servo model minor */
-    sr[3] = 9;    /* servo model major: 9 (STS3215) */
 }
 
 /* Save current register state to EEPROM. */
