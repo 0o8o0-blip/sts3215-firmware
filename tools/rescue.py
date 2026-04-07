@@ -49,11 +49,17 @@ def find_factory_firmware():
         print(f"  Using cached firmware: {cache_path}")
         return open(cache_path, 'rb').read()
 
-    # Try downloading from Feetech server
+    # Try downloading from Feetech server.
+    # The Feetech firmware API takes a model version string (e.g. '9.2'
+    # for STS3215), NOT the firmware filename. The model version is the
+    # major.minor read from servo registers 3 and 4 — but a bricked motor
+    # can't respond to UART, so we hardcode '9.2' for STS3215, which is
+    # the only model this rescue script supports.
+    # See flash_tool.py FIRMWARE_API_DOWNLOAD docs for the model list.
     try:
         from flash_tool import download_firmware
         print("  Downloading from Feetech server...")
-        result = download_firmware('SCServo21-GD32-TTL')
+        result = download_firmware('9.2')
         if result and result.get('data'):
             fw_enc = result['data']  # Already encrypted from server
             # Cache for next time
