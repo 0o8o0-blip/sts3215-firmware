@@ -35,6 +35,14 @@ void __attribute__((noinline)) flash_page_erase(uint32_t page_addr)
     fmc[4] |= 0x02;            /* CTL |= PER: page erase */
     fmc[5] = page_addr;        /* ADDR = target page address */
     fmc[4] |= 0x40;            /* CTL |= STRT: start erase */
+    /* CRITICAL: BSY is not asserted instantly after STRT — there is a
+     * propagation delay across the AHB→FMC bridge. If we read FMC_STAT
+     * on the very next instruction, BSY may still read 0 and the loop
+     * exits before the erase has even begun. We then clear PER, which
+     * aborts the in-flight erase and leaves flash in an inconsistent
+     * state — BSY then *genuinely* hangs on the NEXT flash op.
+     * Force a few cycles of delay before the first STAT read. */
+    __asm__ volatile ("nop\n nop\n nop\n nop\n nop\n nop\n");
     while (fmc[3] & 1) {}      /* Wait for BSY to clear */
     fmc[4] &= ~0x02U;          /* CTL &= ~PER */
 }
@@ -50,6 +58,8 @@ void __attribute__((noinline)) flash_write_halfword(uint16_t *addr, uint16_t val
     __asm__ volatile ("" : "+r"(fmc));
     fmc[4] |= 0x01;            /* CTL |= PG: programming */
     *addr = value;              /* Write halfword to flash */
+    /* See flash_page_erase — same BSY-propagation race applies here. */
+    __asm__ volatile ("nop\n nop\n nop\n nop\n nop\n nop\n");
     while (fmc[3] & 1) {}      /* Wait for BSY */
     fmc[4] &= ~0x01U;          /* CTL &= ~PG */
 }
