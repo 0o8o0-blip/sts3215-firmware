@@ -165,6 +165,14 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
         sr[2] = 0;
         sr[3] = 9;
     }
+
+    /* Fix uninitialized PI gains from old EEPROM pages that predate
+     * regs 50-53 being EEPROM-backed. Those page positions were never
+     * written, so they read as 0xFFFF. Replace with firmware defaults. */
+    if (*(uint16_t *)(sr + SR_CURRENT_KP_LO) == 0xFFFF)
+        *(uint16_t *)(sr + SR_CURRENT_KP_LO) = 3;
+    if (*(uint16_t *)(sr + SR_CURRENT_KI_LO) == 0xFFFF)
+        *(uint16_t *)(sr + SR_CURRENT_KI_LO) = 50;
 }
 
 /* Save current register state to EEPROM. */
