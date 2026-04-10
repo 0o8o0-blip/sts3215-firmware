@@ -116,13 +116,15 @@ void __attribute__((noinline)) motor_obj_init(uint8_t *param)
     gpio_config_pin(nvic_cfg);
 }
 
-/* Check TIMER0 update interrupt flag. Returns 1 if elapsed, 0 otherwise. */
+/* Check TIMER0 update tick. The TIMER0 ISR clears the hardware UPIF flag
+ * (needed to prevent re-entry), so we check a software flag instead.
+ * The ISR sets timer_tick_flag every cycle (~24 kHz). */
+extern volatile uint8_t timer_tick_flag;
 uint32_t __attribute__((noinline)) timer_tick_elapsed(uint8_t *ctrl)
 {
     (void)ctrl;
-    volatile uint16_t *timer0_intf = (volatile uint16_t *)(TIMER0_BASE + 0x10);
-    if ((*timer0_intf & 1) != 0) {
-        *timer0_intf = *timer0_intf & 0xFFFE;
+    if (timer_tick_flag) {
+        timer_tick_flag = 0;
         return 1;
     }
     return 0;

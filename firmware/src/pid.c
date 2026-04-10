@@ -863,7 +863,21 @@ void __attribute__((noinline)) pid_current_compute(uint8_t *param)
         /* I-term integrate */
         int32_t ki = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KI_LO);
         if (ki == 0) { s[1] = 0; }
-        else { s[1] += s[0] - s[2]; }
+        else {
+            s[1] += s[0] - s[2];
+            /* Direct integrator clamp — prevents wind-up when the motor
+             * breaks free and back-EMF makes the setpoint unreachable.
+             * The back-calculation anti-windup at the output clamp only
+             * activates when output saturates, but a spinning motor can
+             * have unsaturated output with unreachable current goal.
+             * Limit so I-term alone can't exceed max_output:
+             *   I = s[1] * ki / 1000 <= max_output
+             *   s[1] <= max_output * 1000 / ki                        */
+            int16_t max_out = *(int16_t *)(servo_regs_arr + SR_MAX_OUTPUT_LO);
+            int32_t imax = ((int32_t)max_out * 1000) / ki;
+            if (s[1] > imax) s[1] = imax;
+            else if (s[1] < -imax) s[1] = -imax;
+        }
     }
     int32_t p, i;
     {

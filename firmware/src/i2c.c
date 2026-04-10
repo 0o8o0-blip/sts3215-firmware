@@ -213,60 +213,30 @@ void __attribute__((noinline)) i2c_hw_init(uint8_t *param)
     /* Configure peripheral transfer count */
     periph[0x2C/4] |= (pin_idx - 1) * 0x100000;
 
-    /* Configure ADC trigger and control.
-     * CTL0: SCAN mode (multiple channels per trigger)
-     * CTL1: ETSRC=001 (TIMER0_CH1), ETERC=1 (external trigger enable)
-     *        ADON=1. No continuous mode — timer triggers each scan.
+    /* Configure ADC for software-triggered single conversions.
+     * The TIMER0_BRK_UP_TRG_COM_IRQHandler in main.c uses SWRCST to
+     * sample channels at precise times. No DMA, no scan, no external
+     * trigger.
      *
-     * TIMER0 CH1 fires once per PWM cycle at a configurable point,
-     * triggering one ADC scan that captures current during the ON phase. */
-    periph[0x04/4] |= 0x100;                /* CTL0: SCAN */
-    periph[0x08/4] |= (0x01 << 17) | (1 << 20); /* CTL1: ETSRC=001(TIMER0_CH1), ETERC=1 */
+     * CTL1: ETSRC=111 (software trigger required for SWRCST)
+     *       ETERC=0 (don't enable external trigger)
+     *       DMA=0  (no DMA, ISR reads RDATA directly)
+     *       ADON=1 (power on) */
+    periph[0x08/4] |= (0x07U << 17) | (1U << 20); /* CTL1: ETSRC=111 (software), ETERC=1 */
     periph[0x08/4] |= 1;                    /* ADON */
     periph[0x08/4] |= 8;                    /* RSTCLB */
 
-    /* Wait for calibration reset */
     while ((periph[0x08/4] & 8) != 0) { }
 
     /* Calibration */
     periph[0x08/4] |= 4;
     while ((periph[0x08/4] & 4) != 0) { }
 
-    /* Configure DMA channel 0 for single scan (3 channels) */
-    volatile uint32_t *dma_ch0 = (volatile uint32_t *)DMA_CH0_BASE;
-    dma_ch0[2] = 0x4001244CU;             /* PADDR: ADC regular data */
-    dma_ch0[3] = (uint32_t)(param + 4);   /* MADDR: DMA buffer in i2c_ctrl */
-    *dma_ch0 = 0x1580;                     /* CTL: single-shot, periph-to-mem, halfword */
-    dma_ch0[1] = pin_idx;                  /* CNT: 3 channels */
-
-    /* Clear DMA channel 0 transfer complete flag */
-    *(volatile uint32_t *)(DMA_BASE + 4) = 2;
-
-    /* Enable DMA channel */
-    *dma_ch0 |= 1;
-
-    /* Enable ADC DMA mode (bit 8) and start first conversion. */
-    periph[0x08/4] |= (1 << 8);   /* CTL1: DMA enable */
-
-    /* Configure TIMER0 CH1 as internal trigger for ADC.
-     * CH1 in output compare mode, no GPIO output.
-     * CH1CV = 10 (trigger early in ON phase). Updated at runtime. */
-    {
-        volatile uint32_t *timer0 = (volatile uint32_t *)0x40012C00U;
-        /* CHCTL0: CH1 bits [14:12] = 000 (frozen/compare), no output.
-         * Don't touch CH0 bits [6:4] (PWM mode for motor). */
-        uint32_t chctl0 = timer0[0x18/4];
-        chctl0 &= 0x00FF;          /* keep CH0 config */
-        chctl0 |= 0x3000;          /* CH1: OC mode 011 = toggle (generates event) */
-        timer0[0x18/4] = chctl0;
-
-        /* CH1CV: trigger point = 10 (near start of ON phase) */
-        timer0[0x38/4] = 10;
-
-        /* Enable CH1 compare event: CHCTL2 bit 4 = CH1E */
-        timer0[0x20/4] |= 0x0010;
-    }
-
+    /* Pre-load DMA buffer slots so existing code paths see something
+     * sensible until the ISR has run a few times. */
+    *(volatile uint16_t *)(param + 4 + 0) = 0;  /* slot 0: temp */
+    *(volatile uint16_t *)(param + 4 + 2) = 0;  /* slot 1: current */
+    *(volatile uint16_t *)(param + 4 + 4) = 0;  /* slot 2: voltage */
 }
 
 /* I2C0 event IRQ handler. */
@@ -331,20 +301,16 @@ uint16_t __attribute__((noinline)) i2c_read_data(uint8_t *param)
     return ((uint16_t)param[1] << 8) | (uint16_t)param[2];
 }
 
-/* Check DMA channel 0 transfer complete flag and clear it. */
+/* Software-driven "data ready" flag set by the TIMER0 ISR each time it
+ * completes a full sweep (current + voltage + temperature). The main_tick
+ * checks this and processes the latest readings. */
+extern volatile uint8_t adc_isr_data_ready;
+
 uint32_t __attribute__((noinline)) i2c_data_ready(uint8_t *ctrl)
 {
     (void)ctrl;
-    volatile uint32_t *dma = (volatile uint32_t *)DMA_BASE;
-    if ((dma[0] & 2) != 0) {
-        dma[1] = 2;  /* Clear FTFIF0 via DMA_INTC */
-
-
-        /* Re-arm DMA for next trigger */
-        volatile uint32_t *dma_ch0 = (volatile uint32_t *)DMA_CH0_BASE;
-        *dma_ch0 &= ~1U;  /* Disable channel */
-        dma_ch0[1] = 3;   /* Reset CNT to 3 */
-        *dma_ch0 |= 1;    /* Re-enable */
+    if (adc_isr_data_ready) {
+        adc_isr_data_ready = 0;
         return 1;
     }
     return 0;
