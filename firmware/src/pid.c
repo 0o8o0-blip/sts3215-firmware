@@ -28,6 +28,52 @@ extern uint32_t position_linearize(uint32_t position);
 /* Forward declarations within this file */
 void pid_full_compute(uint8_t *param);
 void pid_speed_compute(uint8_t *param);
+
+/* ================================================================
+ * Active current limiter — scales down PWM output when measured
+ * current exceeds SR_MAX_CURRENT.
+ *
+ * Unlike the existing overload_protect (which is a delayed shutdown),
+ * this acts instantly and proportionally: if current is 2x the limit,
+ * output is halved. Runs in ALL modes (position, speed, PWM, current)
+ * because it sits between the PID output and pwm_apply_output.
+ *
+ * Uses adc_on_phase_peak (the same 12-bit ON-phase sample that mode 4
+ * uses) for consistent measurement across modes.
+ * ================================================================ */
+extern volatile uint16_t adc_on_phase_peak;
+
+/* Persistent state for the current limiter — tracks the maximum safe
+ * output magnitude across ticks. Ramps down when over-current, ramps
+ * up when within limit. Avoids bang-bang oscillation. */
+static int16_t current_limit_ceiling = 970;  /* start at max PWM period */
+
+static void current_limit_apply(void)
+{
+    uint16_t max_curr = *(uint16_t *)(servo_regs_arr + SR_MAX_CURRENT_LO);
+    if (max_curr == 0) return;  /* 0 = no limit */
+
+    uint16_t actual = adc_on_phase_peak;
+
+    if (actual > max_curr) {
+        /* Over limit: ramp the ceiling down. Faster ramp when further
+         * over (proportional step). Min ceiling = 1 to avoid deadlock. */
+        int32_t step = (int32_t)(actual - max_curr) / 4;
+        if (step < 1) step = 1;
+        current_limit_ceiling -= (int16_t)step;
+        if (current_limit_ceiling < 1) current_limit_ceiling = 1;
+    } else {
+        /* Within limit: slowly ramp ceiling back up toward max period */
+        current_limit_ceiling += 2;
+        if (current_limit_ceiling > 970) current_limit_ceiling = 970;
+    }
+
+    /* Clamp output magnitude to the ceiling */
+    volatile int16_t *out = (volatile int16_t *)(pwm_ctrl_arr + PWM_OUTPUT);
+    int16_t val = *out;
+    if (val > current_limit_ceiling) *out = current_limit_ceiling;
+    else if (val < -current_limit_ceiling) *out = -current_limit_ceiling;
+}
 void pid_current_compute(uint8_t *param);
 void position_pid_reset(uint8_t *state);
 void speed_pid_reset(uint8_t *state);
@@ -644,9 +690,7 @@ position_mode:
         if (torque_enable != 1) {
             position_pid_reset(pid_state_arr);
         }
-        /* pwm_apply_output: r2=torque_enable controls PA6 (H-bridge enable).
-         * torque_enable=1 → PA6 HIGH → motor driver ON.
-         * torque_enable=0 → PA6 LOW → motor driver OFF. */
+        current_limit_apply();
         pwm_apply_output(timer_ctrl_arr,
                          (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
                          (int32_t)torque_enable, 0);
@@ -664,6 +708,7 @@ speed_mode:
         if (torque_enable != 1) {
             speed_pid_reset(pid_state_arr);
         }
+        current_limit_apply();
         pwm_apply_output(timer_ctrl_arr,
                          (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
                          (int32_t)torque_enable, 0);
@@ -682,6 +727,7 @@ current_mode:
         if (torque_enable != 1) {
             speed_pid_reset(pid_state_arr);
         }
+        current_limit_apply();
         pwm_apply_output(timer_ctrl_arr,
                          (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
                          (int32_t)torque_enable, 0);
