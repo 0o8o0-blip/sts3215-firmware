@@ -588,8 +588,116 @@ void __attribute__((noinline, section(".text.keep"))) encoder_track_multiturn(in
     enc_state[1] = current + enc_state[2] * ENCODER_FULL_REV;
 }
 
-/* ON-phase current peak — written by Step 1 oversampling, read by mode 4 PID */
+/* ON-phase current peak — written by TIMER0 update ISR, read by mode 4 PID */
 volatile uint16_t adc_on_phase_peak;
+
+/* Software flag set by the ISR when a full sweep (current + temp + voltage)
+ * has been completed. main_tick / i2c_data_ready check this. */
+volatile uint8_t adc_isr_data_ready;
+
+/* Software replacement for TIMER0 UPIF — the ISR clears the hardware flag,
+ * so timer_tick_elapsed can't see it. This flag restores that signal path. */
+volatile uint8_t timer_tick_flag;
+
+/* TIMER0 update interrupt counter — used to time-multiplex voltage/temp
+ * sampling at lower rates than current. */
+static volatile uint16_t timer0_isr_counter;
+
+/* ================================================================
+ * TIMER0 update interrupt handler — runs at PWM cycle rate (24kHz).
+ *
+ * Fires at the start of each new PWM cycle (counter overflow).
+ * Triggers a single ADC SWRCST conversion to sample motor current at
+ * the very start of the ON phase. Time-multiplexes voltage and temp
+ * sampling on every Nth cycle.
+ *
+ * Writes results into the existing i2c_ctrl_arr DMA buffer slots so
+ * that adc_read_temp/voltage/current keep working unchanged:
+ *   slot 0 = temperature  (PA1, ADC CH1)
+ *   slot 1 = current      (PA3, ADC CH3)
+ *   slot 2 = voltage      (PA4, ADC CH4)
+ *
+ * Sets adc_isr_data_ready every 8 cycles so the main_tick step 3 fires
+ * at ~3kHz (matching the original ~24kHz ÷ 8 cadence).
+ * ================================================================ */
+void __attribute__((interrupt)) TIMER0_BRK_UP_TRG_COM_IRQHandler(void)
+{
+    volatile uint32_t *timer0 = (volatile uint32_t *)0x40012C00U;
+    volatile uint32_t *adc = (volatile uint32_t *)0x40012400U;
+
+    /* Clear TIMER0 UPIF (bit 0 of INTF, rc_w0) */
+    timer0[0x10/4] = ~1U;
+
+    /* Set software tick flag — timer_tick_elapsed() checks this instead
+     * of the hardware UPIF that we just cleared. */
+    timer_tick_flag = 1;
+
+    /* If a flash operation is in progress, skip this sample.
+     * The flash controller stalls instruction fetch during erase/program,
+     * which means our busy-wait below could interact unpredictably with
+     * the previous EEPROM save's wait state. Just bail and try next time. */
+    {
+        volatile uint32_t *fmc = (volatile uint32_t *)0x40022000U;
+        if (fmc[3] & 1) {  /* FMC_STAT BSY bit */
+            return;
+        }
+    }
+
+    /* Discard any leftover EOC from a previous interrupted conversion */
+    if (adc[0] & 2) {
+        (void)adc[0x4C/4];
+        adc[0] &= ~2U;
+    }
+
+    /* Pick channel based on counter:
+     *   Every 256 cycles → temperature  (~94 Hz)
+     *   Every 8 cycles   → voltage      (~3 kHz)
+     *   Otherwise        → current      (~21 kHz)
+     */
+    uint16_t cnt = timer0_isr_counter;
+    uint8_t channel;
+    uint8_t buf_slot;
+    if ((cnt & 0xFF) == 0) {
+        channel = 1;
+        buf_slot = 0;
+    } else if ((cnt & 7) == 0) {
+        channel = 4;
+        buf_slot = 2;
+    } else {
+        channel = 3;
+        buf_slot = 1;
+    }
+    timer0_isr_counter = cnt + 1;
+
+    /* Configure ADC for single conversion of selected channel */
+    adc[0x2C/4] = 0;                       /* RSQ0: RL=0 (1 conversion) */
+    adc[0x34/4] = (uint32_t)channel;       /* RSQ2: position 0 = channel */
+
+    /* Trigger SWRCST (bit 22 of CTL1) via bit-banding */
+    *(volatile uint32_t *)0x42248158U = 1U;
+
+    /* Wait for end-of-conversion (EOC = bit 1 of STAT) — bounded busy-wait */
+    for (int w = 0; w < 200; w++) {
+        if (adc[0] & 2) break;
+    }
+
+    /* Read result and write to the i2c_ctrl_arr DMA buffer slot
+     * (existing adc_read_* functions read from there). */
+    if (adc[0] & 2) {
+        uint16_t value = (uint16_t)(adc[0x4C/4] & 0xFFF);
+        adc[0] &= ~2U;
+        *(volatile uint16_t *)(i2c_ctrl_arr + 4 + buf_slot * 2) = value;
+        if (channel == 3) {
+            adc_on_phase_peak = value;
+        }
+    }
+
+    /* Set data_ready flag every cycle — factory DMA fired at 24kHz
+     * (TIMER0_CH1 triggered ADC scan, DMA completed once per PWM cycle).
+     * The original "every 8 cycles" assumption was wrong and caused
+     * the speed PID to run 8x too slowly. */
+    adc_isr_data_ready = 1;
+}
 
 /* Main tick — called every iteration of the main loop. */
 void __attribute__((noinline)) main_tick(void)
@@ -601,60 +709,12 @@ void __attribute__((noinline)) main_tick(void)
      * Step4_check: if PHASE0, step4; else step5 */
 
     /* Step 1: Check TIMER0 update interrupt for tick.
-     * Timer update = start of ON phase. Oversample current here. */
+     * ON-phase current sensing now happens in TIMER0_IRQHandler at the
+     * exact moment of the timer update event (no main_tick polling delay,
+     * no race with the regular ADC scan). */
     {
         uint32_t result = timer_tick_elapsed(timer_ctrl_arr);
         if (result != 0) {
-            /* ON-phase current oversampling (mode 4/5 only).
-             * At the start of each PWM cycle, briefly switch ADC to
-             * software trigger + current channel only, take one sample,
-             * restore. This captures peak ON-phase current even at low duty.
-             *
-             * GD32F130 has no injected ADC channels (reserved registers).
-             * SWRCST requires ETSRC=111 (software trigger mode).
-             * ARM bit-banding writes individual CTL1 bits without
-             * re-writing ADON, which would trigger spurious conversions.
-             *
-             * Bit-band addresses for ADC CTL1 (0x40012408):
-             *   DMA    (bit 8):  0x42248120
-             *   ETSRC1 (bit 18): 0x42248148
-             *   ETSRC2 (bit 19): 0x4224814C
-             *   SWRCST (bit 22): 0x42248158 */
-            if (servo_regs_arr[SR_OPERATING_MODE] >= 4) {
-                volatile uint32_t *adc = (volatile uint32_t *)0x40012400U;
-
-                /* Save RSQ, switch to software trigger + CH3 only */
-                uint32_t rsq0_save = adc[0x2C/4];
-                uint32_t rsq2_save = adc[0x34/4];
-                *(volatile uint32_t *)0x42248120U = 0U;  /* DMA=0 */
-                *(volatile uint32_t *)0x42248148U = 1U;  /* ETSRC1=1 */
-                *(volatile uint32_t *)0x4224814CU = 1U;  /* ETSRC2=1 */
-                adc[0x2C/4] = 0;   /* RL=0 (1 channel) */
-                adc[0x34/4] = 3;   /* RSQ2 pos0 = CH3 */
-
-                /* Flush: first conversion after ETSRC switch reads stale
-                 * data from the old scan position. Discard it. */
-                *(volatile uint32_t *)0x42248158U = 1U;
-                for (int w = 0; w < 100; w++) { if (adc[0] & 2) break; }
-                (void)adc[0x4C/4];
-                adc[0] &= ~2U;
-
-                /* Sample current at start of ON phase */
-                *(volatile uint32_t *)0x42248158U = 1U;
-                for (int w = 0; w < 100; w++) { if (adc[0] & 2) break; }
-                if (adc[0] & 2) {
-                    adc_on_phase_peak = (uint16_t)(adc[0x4C/4] & 0xFFF);
-                    adc[0] &= ~2U;
-                }
-
-                /* Restore RSQ and trigger mode */
-                adc[0x34/4] = rsq2_save;
-                adc[0x2C/4] = rsq0_save;
-                *(volatile uint32_t *)0x42248148U = 0U;
-                *(volatile uint32_t *)0x4224814CU = 0U;
-                *(volatile uint32_t *)0x42248120U = 1U;  /* DMA=1 */
-            }
-
             encoder_start_read(encoder_ctrl_arr);
         }
     }
@@ -860,6 +920,12 @@ int main(void)
      * do this via gpio_config_pin in usart1_dma_init, but verify it
      * wasn't accidentally disabled by error handlers during boot. */
     *(volatile uint32_t *)0xE000E100 = 0x10000000U;  /* NVIC_ISER bit 28 */
+
+    /* Enable TIMER0 update interrupt for ADC time-multiplexed sampling.
+     * IRQ 13 = TIMER0_BRK_UP_TRG_COM. NVIC_ISER0 bit 13 = 0x2000.
+     * TIMER0 DMAINTEN bit 0 = UPIE (update interrupt enable). */
+    *(volatile uint32_t *)0xE000E100 |= 0x00002000U;
+    *(volatile uint16_t *)(0x40012C00U + 0x0C) |= 0x0001U;
 
 
     /* Main loop — original: str 0xAAAA to FWDGT_CTL, bl main_tick, b loop */
