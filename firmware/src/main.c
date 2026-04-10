@@ -55,9 +55,13 @@ uint8_t reg_permissions[88] = {
     /* regs 16-39: torque, config, PID, deadzone, punch, mode, accel (RW+EEPROM) */
     0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
     0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
-    /* regs 40-55: runtime RW (torque enable, goal, speed, etc.) */
+    /* regs 40-49: runtime RW (torque enable, goal, speed, max output) */
     0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
-    0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
+    0x03, 0x03,
+    /* regs 50-53: current PI gains (RW+EEPROM — persist across power cycles) */
+    0x07, 0x07, 0x07, 0x07,
+    /* regs 54-55: reserved, lock (runtime) */
+    0x03, 0x03,
     /* regs 56-77: present position, speed, load, voltage, temp, etc. (RO) */
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
@@ -240,6 +244,19 @@ void __attribute__((noinline)) servo_defaults_init(void)
     sr[37] = 0x0A;    /* speed I gain (10) */
     sr[38] = 0xC8;    /* reserved (factory=200) */
     sr[39] = 0xC8;    /* overload ratio (200) */
+
+    /* Mode 4 current PI defaults — tuned on dyno:
+     * Kp=3, Ki=50 tracks setpoints 0-30 within ±8% at stall,
+     * recovers cleanly from free-spin→stall transitions.
+     * Higher Kp (e.g. 100) causes oscillation at stall. */
+    *(volatile uint16_t *)(sr + 50) = 3;    /* current Kp */
+    *(volatile uint16_t *)(sr + 52) = 50;   /* current Ki */
+
+    /* Lock must be 0 for EEPROM writes to work. On blank-EEPROM boot,
+     * eeprom_page_load_defaults copies 0xFF from the erased page into
+     * servo_regs[55], which locks the register table and silently
+     * prevents all subsequent UART writes from persisting. */
+    sr[55] = 0;
 
     /* Permission/flags table at offset 0x50 */
     sr[80] = 2;
@@ -915,6 +932,12 @@ int main(void)
 
     /* Store vtable pointers (done after init, before main loop) */
     vtable_store_all();
+
+    /* Ensure lock=0 AFTER all init (including eeprom_page_load_defaults).
+     * On blank-EEPROM boot, the EEPROM load copies 0xFF into sr[55],
+     * which disables all EEPROM writes via reg_write_side_effects.
+     * Must happen after init so it overrides the garbage from EEPROM. */
+    servo_regs_arr[SR_LOCK] = 0;
 
     /* Ensure USART1 IRQ is enabled in NVIC — the init sequence should
      * do this via gpio_config_pin in usart1_dma_init, but verify it

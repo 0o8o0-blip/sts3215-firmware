@@ -31,48 +31,51 @@ void buf_to_regs(uint8_t *dst, uint8_t *src, int32_t offset, int32_t count);
 void eeprom_save_byte_internal(uint8_t *ee_ctrl);
 uint16_t * eeprom_find_active_page(uint8_t *ee_ctrl, int32_t mode);
 
+/* ================================================================
+ * EEPROM group table — maps contiguous blocks of EEPROM-backed
+ * registers to positions in the EEPROM flash page.
+ *
+ * Previously packed into pwm_ctrl_arr at magic offsets (EE_GRP_*),
+ * limited to exactly 2 groups. Now a standalone struct supporting
+ * up to MAX_EEPROM_GROUPS, so any register can be EEPROM-backed
+ * without breaking the metadata layout.
+ * ================================================================ */
+#define MAX_EEPROM_GROUPS 8
 
-/* Map register address to EEPROM page offset. */
+static struct {
+    uint8_t count;                        /* number of groups found */
+    uint8_t start[MAX_EEPROM_GROUPS];     /* first register in each group */
+    uint8_t size[MAX_EEPROM_GROUPS];      /* byte count per group */
+    uint8_t offset[MAX_EEPROM_GROUPS];    /* cumulative byte offset in EEPROM page */
+} ee_groups;
+
+/* Map register address to EEPROM page byte offset.
+ * Returns the offset, or 0 if not in any group. */
 uint32_t __attribute__((noinline)) servo_apply_baud(uint8_t *param, int32_t addr)
 {
-    int idx;
-    uint32_t start = (uint32_t)param[EE_GRP_START_BASE];
-
-    if (addr >= (int32_t)start && addr < (int32_t)(param[EE_GRP_SIZE_BASE] + start)) {
-        idx = 0;
-    } else {
-        start = (uint32_t)param[EE_GRP_START1];
-        if (addr < (int32_t)start) {
-            return 0;
+    (void)param;
+    for (uint8_t g = 0; g < ee_groups.count; g++) {
+        uint32_t s = ee_groups.start[g];
+        if ((uint32_t)addr >= s && (uint32_t)addr < s + ee_groups.size[g]) {
+            return (addr - s + ee_groups.offset[g]) & 0xFF;
         }
-        if (addr >= (int32_t)(param[EE_GRP_SIZE2_BASE] + start)) {
-            return 0;
-        }
-        idx = 1;
     }
-    return (addr + (param[idx + EE_GRP_OFFSET_BASE] - start)) & 0xFF;
+    return 0;
 }
 
-/* Reverse mapping — from EEPROM page offset back to register address. */
+/* Reverse mapping — from EEPROM page byte offset back to register address.
+ * Returns the mapped offset, or -1 if not in any group. */
 int32_t __attribute__((noinline)) servo_apply_config(uint8_t *param, int32_t addr)
 {
-    int idx;
+    (void)param;
     uint32_t adj = addr & 0xFF;
-    uint32_t start = (uint32_t)param[EE_GRP_START_BASE];
-
-    if (adj >= start && adj < param[EE_GRP_SIZE_BASE] + start) {
-        idx = 0;
-    } else {
-        start = (uint32_t)param[EE_GRP_START1];
-        if (adj < start) {
-            return -1;
+    for (uint8_t g = 0; g < ee_groups.count; g++) {
+        uint32_t s = ee_groups.start[g];
+        if (adj >= s && adj < s + ee_groups.size[g]) {
+            return (ee_groups.offset[g] - s) + adj;
         }
-        if (adj >= param[EE_GRP_SIZE2_BASE] + start) {
-            return -1;
-        }
-        idx = 1;
     }
-    return (param[idx + EE_GRP_OFFSET_BASE] - start) + adj;
+    return -1;
 }
 
 /* ================================================================
@@ -82,30 +85,45 @@ int32_t __attribute__((noinline)) servo_apply_config(uint8_t *param, int32_t add
  * ================================================================ */
 void __attribute__((noinline)) servo_regs_load_eeprom(uint8_t *param)
 {
-    uint32_t grp = 0;
+    (void)param;
+    uint8_t grp = 0;
     int was_eeprom = 0;
+    uint8_t cumulative_offset = 0;
+
+    /* Zero the table */
+    ee_groups.count = 0;
+    for (int g = 0; g < MAX_EEPROM_GROUPS; g++) {
+        ee_groups.start[g] = 0;
+        ee_groups.size[g] = 0;
+        ee_groups.offset[g] = 0;
+    }
 
     for (int i = 0; i < 0x57; i++) {
         if ((reg_permissions[i] & 4) == 0) {
             /* Not EEPROM-backed */
-            if (was_eeprom) {
-                grp = (grp + 1) & 0xFF;
-                param[grp + EE_GRP_OFFSET_BASE] = param[(grp - 1) + EE_GRP_SIZE_BASE] + param[(grp - 1) + EE_GRP_OFFSET_BASE];
+            if (was_eeprom && grp < MAX_EEPROM_GROUPS) {
+                /* Close current group, start next */
+                grp++;
+                if (grp < MAX_EEPROM_GROUPS) {
+                    ee_groups.offset[grp] = cumulative_offset;
+                }
             }
-            param[grp + EE_GRP_START_BASE] = (uint8_t)(i + 1);
+            if (grp < MAX_EEPROM_GROUPS) {
+                ee_groups.start[grp] = (uint8_t)(i + 1);
+            }
             was_eeprom = 0;
         } else {
-            /* EEPROM-backed — increment size of current group */
-            param[grp + EE_GRP_SIZE_BASE] = param[grp + EE_GRP_SIZE_BASE] + 1;
+            /* EEPROM-backed — grow current group */
+            if (grp < MAX_EEPROM_GROUPS) {
+                ee_groups.size[grp]++;
+                cumulative_offset++;
+            }
             was_eeprom = 1;
         }
     }
-    /* Finalize: build total-offset and mirror entries */
-    uint8_t last_sum = param[grp + EE_GRP_OFFSET_BASE] + param[grp + EE_GRP_SIZE_BASE];
-    param[(grp + 1) + EE_GRP_OFFSET_BASE] = last_sum;
-    param[(grp + 1) + EE_GRP_SIZE_BASE] = param[EE_GRP_SIZE_BASE];
-    param[(grp + 2) + EE_GRP_OFFSET_BASE] = last_sum + param[EE_GRP_SIZE_BASE];
-    param[(grp + 2) + EE_GRP_SIZE_BASE] = param[EE_GRP_SIZE2_BASE];
+    ee_groups.count = was_eeprom ? grp + 1 : grp;
+    if (ee_groups.count > MAX_EEPROM_GROUPS)
+        ee_groups.count = MAX_EEPROM_GROUPS;
 }
 
 /* ================================================================
@@ -114,16 +132,18 @@ void __attribute__((noinline)) servo_regs_load_eeprom(uint8_t *param)
  * ================================================================ */
 void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
 {
+    (void)param;
     uint8_t *sr = servo_regs_arr;
     uint8_t *ec = eeprom_ctrl_arr;
-    regs_to_buf(ec, sr + param[EE_GRP_START_BASE],
-                param[EE_GRP_OFFSET_BASE], param[EE_GRP_SIZE_BASE]);
-    regs_to_buf(ec, sr + param[EE_GRP_START1],
-                param[EE_GRP_OFFSET_BASE + 1], param[EE_GRP_SIZE2_BASE]);
 
-    /* Check EEPROM validity: original at 0x068E checks sr[0]==3,
-     * then at 0x06B0 checks sr[3]==9. Both must pass or defaults load.
-     * After check, version is always set to {3, 10, 0, 9}. */
+    /* Load all EEPROM groups from working buffer into servo_regs */
+    for (uint8_t g = 0; g < ee_groups.count; g++) {
+        regs_to_buf(ec, sr + ee_groups.start[g],
+                    ee_groups.offset[g], ee_groups.size[g]);
+    }
+
+    /* Check EEPROM validity: version must be {3, ?, ?, 9}.
+     * If not (blank or corrupt EEPROM), load firmware defaults. */
     if (sr[0] != 3 || sr[3] != 9) {
         servo_defaults_init();
         sr[0] = 3;
@@ -135,10 +155,10 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
          * erased/invalid page, and any subsequent EEPROM save writes
          * corrupted version headers — causing defaults to reload on
          * every boot and making register writes non-persistent. */
-        buf_to_regs(ec, sr + param[EE_GRP_START_BASE],
-                    param[EE_GRP_OFFSET_BASE], param[EE_GRP_SIZE_BASE]);
-        buf_to_regs(ec, sr + param[EE_GRP_START1],
-                    param[EE_GRP_OFFSET_BASE + 1], param[EE_GRP_SIZE2_BASE]);
+        for (uint8_t g = 0; g < ee_groups.count; g++) {
+            buf_to_regs(ec, sr + ee_groups.start[g],
+                        ee_groups.offset[g], ee_groups.size[g]);
+        }
     } else {
         sr[0] = 3;
         sr[1] = 10;
@@ -150,14 +170,23 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
 /* Save current register state to EEPROM. */
 void __attribute__((noinline)) eeprom_save_regs(uint8_t *param)
 {
+    (void)param;
     uint8_t *sr = servo_regs_arr;
     uint8_t *ec = eeprom_ctrl_arr;
     uint8_t saved_byte5 = sr[5];
 
-    regs_to_buf(ec, sr + param[EE_GRP_START_BASE],
-                param[EE_GRP_SAVE_OFF0], param[EE_GRP_SAVE_SIZE0]);
-    regs_to_buf(ec, sr + param[EE_GRP_START1],
-                param[EE_GRP_SAVE_OFF1], param[EE_GRP_SAVE_SIZE1]);
+    /* Compute total offset (where backup copies start in the mirror) */
+    uint8_t total = 0;
+    for (uint8_t g = 0; g < ee_groups.count; g++)
+        total += ee_groups.size[g];
+
+    /* Load backup copies from mirror into servo_regs */
+    uint8_t save_off = total;
+    for (uint8_t g = 0; g < ee_groups.count; g++) {
+        regs_to_buf(ec, sr + ee_groups.start[g],
+                    save_off, ee_groups.size[g]);
+        save_off += ee_groups.size[g];
+    }
 
     sr[0] = 3;
     sr[1] = 10;
@@ -165,17 +194,19 @@ void __attribute__((noinline)) eeprom_save_regs(uint8_t *param)
     sr[3] = 9;
     sr[5] = saved_byte5;
 
-    buf_to_regs(ec, sr + param[EE_GRP_START_BASE],
-                param[EE_GRP_OFFSET_BASE], param[EE_GRP_SIZE_BASE]);
-    buf_to_regs(ec, sr + param[EE_GRP_START1],
-                param[EE_GRP_OFFSET_BASE + 1], param[EE_GRP_SIZE2_BASE]);
+    /* Write servo_regs back to mirror at primary offsets */
+    for (uint8_t g = 0; g < ee_groups.count; g++) {
+        buf_to_regs(ec, sr + ee_groups.start[g],
+                    ee_groups.offset[g], ee_groups.size[g]);
+    }
 
     eeprom_save_byte_internal(ec);
 }
 
-/* Write firmware header to EEPROM page and both register groups to flash. */
+/* Write firmware header to EEPROM page and all register groups to flash. */
 void __attribute__((noinline, optimize("no-optimize-sibling-calls"))) eeprom_page_header_write(uint8_t *param)
 {
+    (void)param;
     uint8_t *sr = servo_regs_arr;
     uint8_t *ec = eeprom_ctrl_arr;
 
@@ -184,10 +215,17 @@ void __attribute__((noinline, optimize("no-optimize-sibling-calls"))) eeprom_pag
     sr[2] = 0;
     sr[3] = 9;
 
-    buf_to_regs(ec, sr + param[EE_GRP_START_BASE],
-                param[EE_GRP_SAVE_OFF0], param[EE_GRP_SAVE_SIZE0]);
-    buf_to_regs(ec, sr + param[EE_GRP_START1],
-                param[EE_GRP_SAVE_OFF1], param[EE_GRP_SAVE_SIZE1]);
+    /* Compute save offset (after primary data) */
+    uint8_t save_off = 0;
+    for (uint8_t g = 0; g < ee_groups.count; g++)
+        save_off += ee_groups.size[g];
+
+    /* Write all groups to mirror at save offsets */
+    for (uint8_t g = 0; g < ee_groups.count; g++) {
+        buf_to_regs(ec, sr + ee_groups.start[g],
+                    save_off, ee_groups.size[g]);
+        save_off += ee_groups.size[g];
+    }
 
     eeprom_save_byte_internal(ec);
 }
