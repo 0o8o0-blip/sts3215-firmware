@@ -136,6 +136,12 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
     uint8_t *sr = servo_regs_arr;
     uint8_t *ec = eeprom_ctrl_arr;
 
+    /* Save firmware defaults BEFORE EEPROM load overwrites them.
+     * servo_defaults_init already ran, so sr[] has all defaults.
+     * We need them to patch any 0xFFFF slots from old EEPROM pages. */
+    uint8_t defaults[88];
+    for (int i = 0; i < 88; i++) defaults[i] = sr[i];
+
     /* Load all EEPROM groups from working buffer into servo_regs */
     for (uint8_t g = 0; g < ee_groups.count; g++) {
         regs_to_buf(ec, sr + ee_groups.start[g],
@@ -150,11 +156,7 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
         sr[1] = 10;
         sr[2] = 0;
         sr[3] = 9;
-        /* Sync defaults + version back to EEPROM working buffer.
-         * Without this, the working buffer retains 0xFF from the
-         * erased/invalid page, and any subsequent EEPROM save writes
-         * corrupted version headers — causing defaults to reload on
-         * every boot and making register writes non-persistent. */
+        /* Sync defaults + version back to EEPROM working buffer. */
         for (uint8_t g = 0; g < ee_groups.count; g++) {
             buf_to_regs(ec, sr + ee_groups.start[g],
                         ee_groups.offset[g], ee_groups.size[g]);
@@ -164,6 +166,32 @@ void __attribute__((noinline)) eeprom_page_load_defaults(uint8_t *param)
         sr[1] = 10;
         sr[2] = 0;
         sr[3] = 9;
+
+        /* Patch uninitialized EEPROM slots: any EEPROM-backed halfword
+         * that reads 0xFFFF was never written (old firmware didn't have
+         * that register as EEPROM-backed). Replace with the firmware
+         * default. Handles all current and future register additions
+         * without per-register guards. */
+        int patched = 0;
+        for (uint8_t g = 0; g < ee_groups.count; g++) {
+            uint8_t start = ee_groups.start[g];
+            uint8_t size = ee_groups.size[g];
+            for (uint8_t i = 0; i < size; i += 2) {
+                uint8_t reg = start + i;
+                if (reg + 1 < 88 && *(uint16_t *)(sr + reg) == 0xFFFF) {
+                    *(uint16_t *)(sr + reg) = *(uint16_t *)(defaults + reg);
+                    patched = 1;
+                }
+            }
+        }
+        /* If any slots were patched, sync the fixes to the working
+         * buffer so the next EEPROM save writes correct values. */
+        if (patched) {
+            for (uint8_t g = 0; g < ee_groups.count; g++) {
+                buf_to_regs(ec, sr + ee_groups.start[g],
+                            ee_groups.offset[g], ee_groups.size[g]);
+            }
+        }
     }
 }
 
