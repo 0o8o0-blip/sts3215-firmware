@@ -907,6 +907,15 @@ int main(void)
         p = (volatile uint8_t *)eeprom_ctrl_arr; eeprom_init((uint8_t *)p);
         p = pwm_ctrl;    pwm_init((uint8_t *)p);
         p = timer_ctrl;  timer15_init_wrapper((uint8_t *)p);
+
+        /* Enable TIMER0 update interrupt BEFORE i2c_mode_init, so the
+         * ADC ISR is running during the current-sense warmup baseline
+         * calibration. Without this, the warmup reads zeros from the
+         * pre-loaded DMA buffer, baseline calibrates to 0, and every
+         * subsequent idle read looks like current → false overload. */
+        *(volatile uint32_t *)0xE000E100 |= 0x00002000U;  /* NVIC ISER0 bit 13 */
+        *(volatile uint16_t *)(0x40012C00U + 0x0C) |= 0x0001U;  /* TIMER0 UPIE */
+
         p = i2c_ctrl;    i2c_mode_init((uint8_t *)p);
         p = encoder_ctrl; encoder_init_all((uint8_t *)p);
         /* Original reads servo_regs[6] (baud index) and passes as r1 */
@@ -944,11 +953,7 @@ int main(void)
      * wasn't accidentally disabled by error handlers during boot. */
     *(volatile uint32_t *)0xE000E100 = 0x10000000U;  /* NVIC_ISER bit 28 */
 
-    /* Enable TIMER0 update interrupt for ADC time-multiplexed sampling.
-     * IRQ 13 = TIMER0_BRK_UP_TRG_COM. NVIC_ISER0 bit 13 = 0x2000.
-     * TIMER0 DMAINTEN bit 0 = UPIE (update interrupt enable). */
-    *(volatile uint32_t *)0xE000E100 |= 0x00002000U;
-    *(volatile uint16_t *)(0x40012C00U + 0x0C) |= 0x0001U;
+    /* TIMER0 ISR already enabled before i2c_mode_init (see above). */
 
 
     /* Main loop — original: str 0xAAAA to FWDGT_CTL, bl main_tick, b loop */
