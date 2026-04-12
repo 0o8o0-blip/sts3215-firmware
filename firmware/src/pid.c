@@ -868,10 +868,15 @@ static void __attribute__((noinline)) pid_cur_error(int32_t *s)
     }
 
     /* Read actual current from ON-phase oversampling.
-     * Full 12-bit resolution (0-4095). PI gains should be set
-     * ~4x lower than factory defaults for this scale. */
+     * Full 12-bit resolution (0-4095). The ADC reads MAGNITUDE only
+     * (low-side shunt, always positive regardless of motor direction).
+     * Sign the reading based on the goal direction — if goal is
+     * negative, the motor is driving in reverse, so actual current
+     * is also negative. This lets the PI track negative setpoints
+     * without the unsigned-magnitude confusion. */
     extern volatile uint16_t adc_on_phase_peak;
     int32_t actual = (int32_t)adc_on_phase_peak;
+    if (goal < 0) actual = -actual;
 
     s[0] = goal - actual;
 }
