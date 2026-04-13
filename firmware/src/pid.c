@@ -28,6 +28,7 @@ extern uint32_t position_linearize(uint32_t position);
 /* Forward declarations within this file */
 void pid_full_compute(uint8_t *param);
 void pid_speed_compute(uint8_t *param);
+void pid_cascaded_current(uint8_t *param, int16_t current_goal);
 
 /* ================================================================
  * Active current limiter — scales down PWM output when measured
@@ -45,26 +46,35 @@ extern volatile uint16_t adc_on_phase_peak;
 
 /* Persistent state for the current limiter — tracks the maximum safe
  * output magnitude across ticks. Ramps down when over-current, ramps
- * up when within limit. Avoids bang-bang oscillation. */
-static int16_t current_limit_ceiling = 970;  /* start at max PWM period */
+ * up when within limit. Avoids bang-bang oscillation.
+ *
+ * Reset to max when torque transitions from OFF to ON, so each
+ * motor activation starts with full headroom. */
+static int16_t current_limit_ceiling = 970;
+static uint8_t current_limit_prev_torque = 0;
 
 static void current_limit_apply(void)
 {
+    /* Reset ceiling on torque enable transition (OFF→ON) */
+    uint8_t torque = servo_regs_arr[SR_TORQUE_ENABLE];
+    if (torque == 1 && current_limit_prev_torque != 1) {
+        current_limit_ceiling = 970;
+    }
+    current_limit_prev_torque = torque;
+
     uint16_t max_curr = *(uint16_t *)(servo_regs_arr + SR_MAX_CURRENT_LO);
-    if (max_curr == 0) return;  /* 0 = no limit */
+    if (max_curr == 0) return;
 
     uint16_t actual = adc_on_phase_peak;
 
     if (actual > max_curr) {
-        /* Over limit: ramp the ceiling down. Faster ramp when further
-         * over (proportional step). Min ceiling = 1 to avoid deadlock. */
         int32_t step = (int32_t)(actual - max_curr) / 4;
         if (step < 1) step = 1;
         current_limit_ceiling -= (int16_t)step;
         if (current_limit_ceiling < 1) current_limit_ceiling = 1;
     } else {
-        /* Within limit: slowly ramp ceiling back up toward max period */
-        current_limit_ceiling += 2;
+        /* Ramp up faster (was 2, now 4) for quicker recovery */
+        current_limit_ceiling += 4;
         if (current_limit_ceiling > 970) current_limit_ceiling = 970;
     }
 
@@ -569,6 +579,7 @@ void __attribute__((noinline)) position_motion_guard(uint8_t *state)
 
     int64_t integrator = ((int64_t)s[7] << 32) | (uint32_t)s[6];
     int32_t position = (int32_t)(integrator / (int64_t)scale);
+
     *(int32_t *)(pwm_ctrl_arr + PWM_GOAL_POS) = position;
 
     /* Compute velocity from speed and punch divisor */
@@ -672,6 +683,7 @@ void __attribute__((noinline)) motor_output_apply(uint8_t *adc_st)
         if (mode == 3) goto position_mode;
         if (mode == 1) goto speed_mode;
         if (mode == 4) goto current_mode;
+        if (mode == 5) goto position_current_mode;
         /* PWM mode (mode 2): output is handled by motor_safety_apply
          * in Step 3 (calls pwm_mode_compute + pwm_apply_output).
          * TODO: PWM mode doesn't drive motor — needs investigation. */
@@ -725,6 +737,49 @@ current_mode:
     {
         uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
         if (torque_enable != 1) {
+            speed_pid_reset(pid_state_arr);
+        }
+        current_limit_apply();
+        pwm_apply_output(timer_ctrl_arr,
+                         (int32_t)*(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT),
+                         (int32_t)torque_enable, 0);
+    }
+    return;
+
+position_current_mode:
+    /* Cascaded position/current mode (mode 5).
+     *
+     * Outer loop: position PID computes a torque command from position error.
+     * Inner loop: current PI regulates actual motor current to match.
+     *
+     * This gives position control with a physics-guaranteed force limit:
+     * the current loop measures and enforces the force regardless of motor
+     * speed, voltage, or temperature.
+     *
+     * Flow: position PID → PWM_OUTPUT (torque command) → pid_cascaded_current
+     *       → current PI → PWM_OUTPUT (duty) → motor */
+    position_motion_guard(pid_state_arr);
+    pid_full_compute(pid_state_arr + PID_POS_BASE);
+
+    /* Feed position PID output as the current PI goal.
+     * The position PID outputs in "PWM duty units" (±max_output).
+     * The current PI expects "raw ADC current units" (±~30 useful).
+     * Scale: divide by 8 so position max_output=200 → current goal=25.
+     * This maps the position PID's full range to the current PI's
+     * useful tracking range (0-30 raw ADC units at stall). */
+    {
+        int16_t torque_cmd = *(int16_t *)(pwm_ctrl_arr + PWM_OUTPUT);
+        /* Scale position PID output to current PI units.
+         * Position PID outputs ±max_output (PWM duty units).
+         * Current PI expects ±raw ADC units. /4 maps 200→50. */
+        int16_t current_goal = torque_cmd / 4;
+        pid_cascaded_current(encoder_i2c_arr + EI2C_SPEED_STATE, current_goal);
+    }
+
+    {
+        uint8_t torque_enable = servo_regs_arr[SR_TORQUE_ENABLE];
+        if (torque_enable != 1) {
+            position_pid_reset(pid_state_arr);
             speed_pid_reset(pid_state_arr);
         }
         current_limit_apply();
@@ -853,77 +908,26 @@ void __attribute__((noinline)) pid_speed_compute(uint8_t *param)
  *   s[0] = error, s[1] = I-term integrator, s[2] = prev error
  * ================================================================ */
 
-/* Current error = goal_current - actual_current. */
-static void __attribute__((noinline)) pid_cur_error(int32_t *s)
+/* Current PI core — shared by mode 4 (user goal) and mode 5 (position PID goal).
+ * Takes the goal as a parameter instead of reading from registers. */
+static void __attribute__((noinline)) pid_current_core(int32_t *s, int32_t goal)
 {
-    volatile uint8_t *sr = servo_regs;
-
-    /* Read goal from PWM goal registers (sign-magnitude, bit 10 = sign) */
-    uint16_t raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
-    int32_t goal;
-    if (raw & PWM_GOAL_SIGN_BIT) {
-        goal = -(int32_t)(raw & ~(uint16_t)PWM_GOAL_SIGN_BIT);
-    } else {
-        goal = (int32_t)raw;
-    }
-
     /* Read actual current from ON-phase oversampling.
-     * Full 12-bit resolution (0-4095). The ADC reads MAGNITUDE only
-     * (low-side shunt, always positive regardless of motor direction).
-     * Sign the reading based on the goal direction — if goal is
-     * negative, the motor is driving in reverse, so actual current
-     * is also negative. This lets the PI track negative setpoints
-     * without the unsigned-magnitude confusion. */
+     * The ADC reads MAGNITUDE only (low-side shunt, always positive).
+     * Sign the reading based on goal direction for bidirectional control. */
     extern volatile uint16_t adc_on_phase_peak;
     int32_t actual = (int32_t)adc_on_phase_peak;
     if (goal < 0) actual = -actual;
 
     s[0] = goal - actual;
-}
 
-/* Current PID compute — PI controller on motor current. */
-void __attribute__((noinline)) pid_current_compute(uint8_t *param)
-{
-    int32_t *s = (int32_t *)param;
-
-    volatile uint8_t *sr = servo_regs;
-    if (sr[SR_TORQUE_ENABLE] != 1) {
-        s[1] = 0;
-        s[2] = 0;
-        return;
-    }
-
-    /* If goal is zero, output zero immediately — no PID needed.
-     * This prevents ADC noise from causing integrator wind-up. */
-    sr = servo_regs;
-    uint16_t goal_raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
-    if ((goal_raw & ~(uint16_t)PWM_GOAL_SIGN_BIT) == 0) {
-        s[0] = 0;
-        s[1] = 0;
-        s[2] = 0;
-        volatile uint8_t *pc = pwm_ctrl;
-        *(int16_t *)(pc + PWM_OUTPUT) = 0;
-        return;
-    }
-
-    pid_cur_error(s);
-
-    /* Current PI uses dedicated registers (SR_CURRENT_KP/KI)
-     * instead of shared speed PID registers. */
+    /* PI compute: I-term integrate, P-term, I-term output, clamp */
     {
-        /* I-term integrate */
         int32_t ki = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KI_LO);
         if (ki == 0) { s[1] = 0; }
         else {
             s[1] += s[0] - s[2];
-            /* Direct integrator clamp — prevents wind-up when the motor
-             * breaks free and back-EMF makes the setpoint unreachable.
-             * The back-calculation anti-windup at the output clamp only
-             * activates when output saturates, but a spinning motor can
-             * have unsaturated output with unreachable current goal.
-             * Limit so I-term alone can't exceed max_output:
-             *   I = s[1] * ki / 1000 <= max_output
-             *   s[1] <= max_output * 1000 / ki                        */
+            /* Direct integrator clamp */
             int16_t max_out = *(int16_t *)(servo_regs_arr + SR_MAX_OUTPUT_LO);
             int32_t imax = ((int32_t)max_out * 1000) / ki;
             if (s[1] > imax) s[1] = imax;
@@ -932,39 +936,98 @@ void __attribute__((noinline)) pid_current_compute(uint8_t *param)
     }
     int32_t p, i;
     {
-        /* P-term = error * Kp / 10 */
         int32_t kp = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KP_LO);
         int32_t val = s[0] * kp;
         p = (int32_t)(((int64_t)0x66666667 * (int64_t)val) >> 34) - (val >> 31);
     }
     {
-        /* I-term = integrator * Ki / 1000 */
         int32_t ki = (int32_t)*(uint16_t *)(servo_regs_arr + SR_CURRENT_KI_LO);
         int32_t val = s[1] * ki;
         i = (int32_t)(((int64_t)0x10624dd3 * (int64_t)val) >> 38) - (val >> 31);
     }
 
     int32_t output = p + i;
-
     s[2] = s[0];
 
-    /* Clamp to max output */
-    sr = servo_regs;
-    int16_t max_torque = *(int16_t *)(sr + SR_MAX_OUTPUT_LO);
+    volatile uint8_t *sr2 = servo_regs;
+    int16_t max_torque = *(int16_t *)(sr2 + SR_MAX_OUTPUT_LO);
     int16_t neg_max = -max_torque;
     int16_t result;
-
-    if (output < (int32_t)neg_max) {
-        result = neg_max;
-    } else if (output > (int32_t)max_torque) {
-        result = max_torque;
-    } else {
-        result = (int16_t)output;
-    }
+    if (output < (int32_t)neg_max) result = neg_max;
+    else if (output > (int32_t)max_torque) result = max_torque;
+    else result = (int16_t)output;
 
     volatile uint8_t *pc = pwm_ctrl;
     *(int16_t *)(pc + PWM_OUTPUT) = result;
     s[2] = output - (int32_t)result;  /* Anti-windup */
+}
+
+/* Mode 4: current PI with goal from user register (SR_PWM_GOAL_LO). */
+void __attribute__((noinline)) pid_current_compute(uint8_t *param)
+{
+    int32_t *s = (int32_t *)param;
+
+    volatile uint8_t *sr = servo_regs;
+    if (sr[SR_TORQUE_ENABLE] != 1) {
+        s[1] = 0; s[2] = 0;
+        return;
+    }
+
+    /* Read goal from register (sign-magnitude, bit 10 = sign) */
+    sr = servo_regs;
+    uint16_t goal_raw = *(uint16_t *)(sr + SR_PWM_GOAL_LO);
+    if ((goal_raw & ~(uint16_t)PWM_GOAL_SIGN_BIT) == 0) {
+        s[0] = 0; s[1] = 0; s[2] = 0;
+        volatile uint8_t *pc = pwm_ctrl;
+        *(int16_t *)(pc + PWM_OUTPUT) = 0;
+        return;
+    }
+    int32_t goal;
+    if (goal_raw & PWM_GOAL_SIGN_BIT)
+        goal = -(int32_t)(goal_raw & ~(uint16_t)PWM_GOAL_SIGN_BIT);
+    else
+        goal = (int32_t)goal_raw;
+
+    pid_current_core(s, goal);
+}
+
+/* Mode 5 inner loop: current PI with goal from position PID output.
+ * Reuses pid_current_core (same PI math + bidirectional sign fix).
+ *
+ * When the position PID output crosses zero (motor overshoots target),
+ * the bidirectional sign fix flips the ADC reading, creating a
+ * measurement discontinuity. Reset the integrator on sign changes
+ * to prevent the stale accumulation from fighting the new direction. */
+static int8_t cascaded_prev_sign = 0;
+
+void __attribute__((noinline)) pid_cascaded_current(uint8_t *param, int16_t current_goal)
+{
+    int32_t *s = (int32_t *)param;
+
+    volatile uint8_t *sr = servo_regs;
+    if (sr[SR_TORQUE_ENABLE] != 1) {
+        s[1] = 0; s[2] = 0;
+        cascaded_prev_sign = 0;
+        return;
+    }
+
+    if (current_goal == 0) {
+        s[0] = 0; s[1] = 0; s[2] = 0;
+        cascaded_prev_sign = 0;
+        volatile uint8_t *pc = pwm_ctrl;
+        *(int16_t *)(pc + PWM_OUTPUT) = 0;
+        return;
+    }
+
+    /* Reset integrator on sign change to prevent discontinuity */
+    int8_t cur_sign = (current_goal > 0) ? 1 : -1;
+    if (cur_sign != cascaded_prev_sign && cascaded_prev_sign != 0) {
+        s[1] = 0;  /* reset integrator */
+        s[2] = 0;  /* reset prev error */
+    }
+    cascaded_prev_sign = cur_sign;
+
+    pid_current_core(s, (int32_t)current_goal);
 }
 
 /* Reset PID state by zeroing all motion helper fields. */
