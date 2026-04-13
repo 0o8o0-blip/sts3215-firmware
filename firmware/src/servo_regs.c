@@ -330,6 +330,14 @@ void __attribute__((noinline)) reg_write_side_effects(uint8_t *param, uint8_t *r
     if (any_saved) {
         eeprom_save_byte_internal(eeprom_ctrl_arr);
     }
+
+    /* When goal position (reg 42-43) changes, trigger pid_compute to
+     * recompute the 64-bit scaled target from the new goal register.
+     * pid_compute checks state[0] (PID_CW_CHANGED) as a "recompute" flag. */
+    if (start_addr <= SR_GOAL_POS_HI && start_addr + count > SR_GOAL_POS_LO) {
+        extern uint8_t pid_state_arr[];
+        pid_state_arr[0] = 1;  /* trigger goal recompute in pid_compute */
+    }
 }
 
 /* Unlock flash, find active page, write changed regs, lock flash. */

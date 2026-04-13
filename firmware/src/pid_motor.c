@@ -149,10 +149,10 @@ void __attribute__((noinline)) timer0_set_pwm(uint8_t *state,
     volatile int32_t *pdiv = (volatile int32_t *)(pwm_ctrl + 0x2C);
     uint32_t scale = (uint32_t)((*pdiv * 10000) / *pdiv);
 
-    /* Forward channel */
+    /* Forward channel — 64-bit target (state+0x20) */
     smull_store(state + 0x20, state + 0x24, scale, forward);
 
-    /* Reverse channel */
+    /* Reverse channel — 64-bit integrator (state+0x18) */
     pdiv = (volatile int32_t *)(pwm_ctrl + 0x2C);
     scale = (uint32_t)((*pdiv * 10000) / *pdiv);
     smull_store(state + 0x18, state + 0x1C, scale, reverse);
