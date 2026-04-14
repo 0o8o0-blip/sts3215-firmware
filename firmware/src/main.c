@@ -756,6 +756,13 @@ void __attribute__((noinline)) main_tick(void)
             servo_regs_arr[SR_TEMPERATURE] = adc_read_temp(i2c_ctrl_arr);
             servo_regs_arr[SR_VOLTAGE] = adc_read_voltage(i2c_ctrl_arr);
             *(int16_t *)(pwm_ctrl_arr + PWM_CURRENT_SENSE) = adc_read_current(i2c_ctrl_arr);
+
+            /* Expose ON-phase current peak at regs 73-74 (RO).
+             * Raw 12-bit ADC reading from the shunt resistor, sampled at the
+             * PWM on-phase peak by the TIMER0 ISR. Gives real-time motor
+             * current for force sensing, mode 4 PI loop, and host monitoring. */
+            *(uint16_t *)(servo_regs_arr + 73) = adc_on_phase_peak;
+
             motion_step(timer_ctrl_arr + TMR_MOTION_BASE);
             timer_tick_update(timer_ctrl_arr + TMR_MOTION_BASE);
             overload_protect(timer_ctrl_arr + TMR_MOTION_BASE);
