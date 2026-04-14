@@ -59,8 +59,11 @@ void __attribute__((noinline)) pwm_ctrl_hw_init(uint32_t *param)
     *(uint8_t *)((uint8_t *)param + 7) = 0;
 }
 
-/* TIMER15 IRQ handler. */
-void TIMER15_IRQHandler(void)
+/* TIMER16 IRQ handler (IRQ 21).
+ * Despite the "TIMER15" naming in our code, the factory firmware actually
+ * uses TIMER16 (0x40014400) with IRQ 21. The TIMER15_BASE define in
+ * servo_types.h points to 0x40014400 (TIMER16 hardware). */
+void TIMER16_IRQHandler(void)
 {
     timer15_tick_handler(motor_ctrl_arr);
 }
@@ -71,7 +74,8 @@ void __attribute__((noinline)) timer15_tick_handler(uint8_t *param)
     if (param[UART_TX_ACTIVE] == 1) {
         param[UART_ERROR] = 0;
         param[UART_TX_ACTIVE] = 0;
-        uart_tx_start_if_ready(param);
+        extern uint8_t uart_state_arr[];
+        uart_tx_start_if_ready(uart_state_arr);
     }
     /* Clear TIMER15 update interrupt flag */
     REG16(TIMER15_BASE, 0x10) = 0;
@@ -109,7 +113,7 @@ void __attribute__((noinline)) motor_obj_init(uint8_t *param)
 
     /* Configure NVIC for TIMER15 interrupt (IRQ 21) */
     uint8_t nvic_cfg[4];
-    nvic_cfg[0] = 0x15;
+    nvic_cfg[0] = 0x15;  /* IRQ 21 = TIMER16 */
     nvic_cfg[3] = 1;
     nvic_cfg[1] = 0;
     nvic_cfg[2] = 0;

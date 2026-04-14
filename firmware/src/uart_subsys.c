@@ -236,9 +236,25 @@ void __attribute__((noinline)) uart_tx_mode_switch(uint8_t *param)
  * ================================================================ */
 void __attribute__((noinline)) uart_tx_dispatch(uint8_t *param)
 {
+    /* Retry delayed sync_read response — matches factory FUN_08000d88.
+     * If UART_ERROR and UART_SYNC_ID are both set, set up a timer with
+     * baud-rate-based prescaler. Factory uses 48MHz/baud as prescaler
+     * which gives ~109µs delay at 1Mbaud — enough for previous motor
+     * to finish transmitting. The TIMER16 ISR then sends the response. */
     if (param[UART_ERROR] != 0 && param[UART_SYNC_ID] != 0) {
         param[UART_ERROR] = 0;
-        baud_rate_change(param, servo_regs_arr[SR_SERVO_ID]);
+        /* Set up timer with baud-rate prescaler (factory FUN_08003a38) */
+        volatile uint8_t *tb = (volatile uint8_t *)TIMER15_BASE;
+        extern const uint32_t baud_rate_config[];
+        uint8_t baud_idx = servo_regs_arr[7];  /* baud rate index */
+        uint32_t baud = 1000000;
+        if (baud_idx < 8) {
+            baud = baud_rate_config[baud_idx * 2];
+        }
+        *(volatile uint16_t *)(tb + 0x00) &= ~1U;           /* disable CEN */
+        *(volatile uint16_t *)(tb + 0x28) = (uint16_t)(48000000U / baud - 1); /* PSC */
+        *(volatile uint16_t *)(tb + 0x00) |= 1U;             /* enable CEN */
+        param[UART_TX_ACTIVE] = 1;
     }
 }
 
@@ -290,7 +306,7 @@ void __attribute__((noinline)) timer_setup_tx(uint8_t *param, int32_t bit_count,
         *(volatile uint16_t *)(tb + 0x0C) = v;
     }
 
-    /* Set prescaler (offset 0x28) */
+    /* Set prescaler (offset 0x28 = PSC) */
     *(volatile uint16_t *)(tb + 0x28) = (uint16_t)(prescaler - 1);
 
     /* Set period CAR (offset 0x2C) — 32-bit write */
@@ -376,10 +392,24 @@ void __attribute__((noinline)) usart_idle_handler(uint8_t *param)
                 }
                 return;
             }
-            /* Delay needed — set flag and configure timer */
+            /* Delay needed — set flag and configure timer.
+             * Factory uses id_index as prescaler writing to offset 0x30,
+             * but that register doesn't work on our timer setup. Instead,
+             * use baud-rate prescaler with id_index * bit_count as period
+             * to achieve the same net delay. */
             param[UART_TX_ACTIVE] = 1;
             int16_t bit_count = tx_byte_count_calc(param);
-            timer_setup_tx(param, bit_count, param[UART_ERROR]);
+            int16_t scaled_count = bit_count * (int16_t)(uint8_t)param[UART_ERROR];
+            {
+                /* Use the actual bus baud rate, not return_delay register.
+                 * servo_regs_arr[7] = baud rate index (reg 7). */
+                extern const uint32_t baud_rate_config[];
+                uint8_t baud_idx = servo_regs_arr[7];
+                uint32_t baud = 1000000;
+                if (baud_idx < 8) baud = baud_rate_config[baud_idx * 2];
+                uint16_t psc = (uint16_t)(48000000U / baud);
+                timer_setup_tx(param, scaled_count, (int16_t)(psc + 1));
+            }
         }
     }
 }
@@ -455,7 +485,7 @@ void __attribute__((noinline)) factory_reset_handler(void)
  * ================================================================ */
 void __attribute__((noinline)) uart_tx_led_tick(uint8_t *param)
 {
-    uart_tx_dispatch(uart_state_arr);
+    uart_tx_dispatch(param);  /* param = motor_ctrl_arr */
     uart_tx_process(param);
 }
 
