@@ -470,13 +470,12 @@ def flash_firmware(ser, servo_id, firmware_data, firmware_type="bin",
         print("Make sure the servo is powered and connected.")
         return False
 
-    # Step 2: Send magic sequence
+    # Step 2+3: Send magic and wait for ACK (retry — bootloader UART may
+    # not be ready immediately after the firmware-to-bootloader jump).
     print("\n[Step 2] Sending bootloader magic...")
-    send_bootloader_magic(ser, firmware_type)
-
-    # Step 3: Read magic response
-    print("\n[Step 3] Reading magic response...")
     if mode == "dtr":
+        send_bootloader_magic(ser, firmware_type)
+        print("\n[Step 3] Reading magic response...")
         ser.timeout = 2.0
         init_resp = ser.read(7)
         if len(init_resp) < 7:
@@ -484,18 +483,25 @@ def flash_firmware(ser, servo_id, firmware_data, firmware_type="bin",
         else:
             print(f"  Magic response: {init_resp.hex()}")
     else:
-        # Software mode: read 1 byte response to magic
-        ser.timeout = 1.0
-        init_resp = ser.read(1)
-        if init_resp:
-            print(f"  Magic response: 0x{init_resp[0]:02x}")
-            if init_resp[0] == BLOCK_ACK:
-                print("  Got ACK - bootloader ready!")
-            elif init_resp[0] == BLOCK_NAK:
-                print("  Got NAK - bootloader rejected magic, aborting")
+        magic = BOOTLOADER_MAGIC_XBIN if firmware_type == "xbin" else BOOTLOADER_MAGIC_BUS
+        ser.baudrate = 500000
+        got_ack = False
+        for attempt in range(10):
+            ser.reset_input_buffer()
+            ser.write(magic)
+            ser.flush()
+            time.sleep(0.2)
+            ser.timeout = 0.3
+            init_resp = ser.read(1)
+            if init_resp and init_resp[0] == BLOCK_ACK:
+                print(f"  Got ACK on attempt {attempt + 1} - bootloader ready!")
+                got_ack = True
+                break
+            elif init_resp and init_resp[0] == BLOCK_NAK:
+                print(f"  Got NAK on attempt {attempt + 1} - bootloader rejected magic")
                 return False
-        else:
-            print("  Warning: No response to magic (timeout)")
+        if not got_ack:
+            print("  Warning: No response to magic after 10 attempts")
 
     # Step 3b: Send 0x01 handshake byte (from FD.exe 0x40FFE7)
     # This tells the bootloader to prepare for block reception
