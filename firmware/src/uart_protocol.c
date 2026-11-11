@@ -42,7 +42,7 @@
 #define INST_FACTORY_RESET   0x06
 #define INST_BOOTLOADER      0x08
 #define INST_SYNC_WRITE_CLK  0x09
-#define INST_SYNC_WRITE_CLK2 0x0A
+#define INST_RESET           0x0A  /* zero the turn count; registers kept */
 #define INST_REBOOT          0x0B
 #define INST_SYNC_READ       0x82
 #define INST_SYNC_WRITE      0x83
@@ -441,8 +441,12 @@ void uart_dispatch(uint8_t *state)
         /* vtable call: (**(code **)(*param_1 + 0x10))() */
         ((void (*)(void))(*(uint32_t *)(*(uint32_t *)state + 0x10)))();
         break;
-    case INST_SYNC_WRITE_CLK2: /* 0x0A */
-        /* vtable call: (**(code **)(*param_1 + 0x14))() */
+    case INST_RESET:        /* 0x0A */
+        /* vtable call: (**(code **)(*param_1 + 0x14))() = encoder_home_reset.
+         * Feetech's RESET: the revolution counter goes to zero and the control
+         * position onto the current angle; every register is kept. A factory
+         * STS3215 answers FF FF 02 02 0A F1 with FF FF 02 02 00 FB and its
+         * multi-turn position drops by the counted turns. */
         ((void (*)(void))(*(uint32_t *)(*(uint32_t *)state + 0x14)))();
         break;
     case INST_REBOOT:       /* 0x0B */

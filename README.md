@@ -212,6 +212,9 @@ python3 test/golden_periph_test.py
 
 # Regression tests for all 24 bugs + invariant checks (180 assertions)
 python3 test/regression_test.py
+
+# Turn count across the encoder wrap: kept through calibration writes, cleared by RESET
+python3 test/turn_count_test.py
 ```
 
 Tests require `unicorn` (`pip install unicorn`) and `arm-none-eabi-nm` (from the ARM toolchain).
@@ -233,6 +236,7 @@ Checksum:  ~(ID + LENGTH + INSTRUCTION + PARAMS) & 0xFF
 | REG_WRITE | 0x04 | Buffered write |
 | ACTION | 0x05 | Execute buffered writes |
 | FACTORY_RESET | 0x06 | Restore defaults |
+| RESET | 0x0A | Zero the turn count kept across the encoder wrap; registers kept |
 | REBOOT | 0x08 | Reboot / enter bootloader |
 | SYNC_READ | 0x82 | Multi-servo read |
 | SYNC_WRITE | 0x83 | Multi-servo write |
